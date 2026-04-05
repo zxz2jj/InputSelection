@@ -1,0 +1,9 @@
+# 数据集与训练产物（整目录不提交）
+/data/
+/models/
+
+# Python 解释器自动生成的字节码缓存（不要提交）
+__pycache__/
+*.py[cod]
+*$py.class
+.idea/
