@@ -9,6 +9,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import tensorflow as tf
 import numpy as np
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from training_models.load_data import load_fmnist, load_cifar10
@@ -273,6 +274,7 @@ def build_or_load_class_prototypes_dict(
             f'Cached layer_indices {cached_indices} mismatch requested {unique_layer_indices}, recomputing...',
         )
 
+    # 这里可以优化，一次推理拿到多个层的信息而不用循环多次推理
     out = {}
     for layer_index in unique_layer_indices:
         out[layer_index] = build_or_load_class_prototypes(
@@ -336,26 +338,25 @@ def image_data_augmentation(x, transform_id=None):
 
 def get_risk_features(data_without_labelling,
                       model,
-                      prototypes_by_layer,
-                      distance_layer_index,
-                      consistency_layer_indices,
+                      prototypes_by_layer_map,
+                      distance_feature_layer_index,
+                      consistency_feature_layer_indices,
                       logits_layer_index=-2,
                       batch_size=16,
                       num_augmentations=5,
                       augment_repeats_per_transform=3,
                       ):
 
-
     if data_without_labelling is None:
         raise TypeError('data_without_labelling is None')
     if model is None:
         raise TypeError('model is None')
-    if prototypes_by_layer is None:
-        raise TypeError('prototypes_by_layer is None')
-    if consistency_layer_indices is None:
-        raise TypeError('consistency_layer_indices is None')
-    if distance_layer_index is None:
-        raise TypeError('distance_layer_index is None')
+    if prototypes_by_layer_map is None:
+        raise TypeError('prototypes_by_layer_map is None')
+    if consistency_feature_layer_indices is None:
+        raise TypeError('consistency_feature_layer_indices is None')
+    if distance_feature_layer_index is None:
+        raise TypeError('distance_feature_layer_index is None')
     if augment_repeats_per_transform is None or int(augment_repeats_per_transform) < 1:
         raise ValueError('augment_repeats_per_transform must be >= 1')
     augment_repeats_per_transform = int(augment_repeats_per_transform)
@@ -373,21 +374,21 @@ def get_risk_features(data_without_labelling,
     dist_ratio_list = []
     dist_layer_inconsistency_list = []
 
-    consistency_layer_indices = [int(i) for i in consistency_layer_indices]
-    hidden_layer_indices = list(dict.fromkeys([int(distance_layer_index)] + consistency_layer_indices))
+    consistency_feature_layer_indices = [int(i) for i in consistency_feature_layer_indices]
+    hidden_layer_indices = list(dict.fromkeys([int(distance_feature_layer_index)] + consistency_feature_layer_indices))
 
     hidden_layers = {}
     hidden_prototypes = {}
     for idx in hidden_layer_indices:
-        if idx not in prototypes_by_layer:
-            raise ValueError(f'prototypes_by_layer missing layer_index={idx}')
+        if idx not in prototypes_by_layer_map:
+            raise ValueError(f'prototypes_by_layer_map missing layer_index={idx}')
         try:
             hidden_layers[idx] = model.layers[idx]
         except IndexError as e:
             raise ValueError(
                 f'layer_index={idx!r} out of range (model has {len(model.layers)} layers)',
             ) from e
-        hidden_prototypes[idx] = np.asarray(prototypes_by_layer[idx], dtype=np.float32)
+        hidden_prototypes[idx] = np.asarray(prototypes_by_layer_map[idx], dtype=np.float32)
 
     logits_layer = None
     try:
@@ -437,13 +438,13 @@ def get_risk_features(data_without_labelling,
             _proto_dim_checked.add(idx)
 
         dp, dr = _batch_distance_risk_features(
-            hid_flat_by_layer[int(distance_layer_index)],
+            hid_flat_by_layer[int(distance_feature_layer_index)],
             pred_np,
-            hidden_prototypes[int(distance_layer_index)],
+            hidden_prototypes[int(distance_feature_layer_index)],
         )
 
         layer_consistency_flags = []
-        for idx in consistency_layer_indices:
+        for idx in consistency_feature_layer_indices:
             layer_consistency_flags.append(
                 _batch_pred_class_is_min_distance(
                     hid_flat_by_layer[idx],
@@ -505,48 +506,245 @@ def get_risk_features(data_without_labelling,
     return out
 
 
+def build_or_load_risk_features(
+    cache_dir,
+    cache_name,
+    data,
+    model,
+    prototypes_by_layer_map,
+    distance_feature_layer_index,
+    consistency_feature_layer_indices,
+    logits_layer_index=-2,
+    batch_size=16,
+    num_augmentations=5,
+    augment_repeats_per_transform=3,
+    force_recompute=False,
+):
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / cache_name
+
+    if cache_path.is_file() and not force_recompute:
+        z = np.load(cache_path)
+        out = {k: np.asarray(z[k]) for k in z.files}
+        print(f'Loaded risk features from {cache_path}')
+        return out
+
+    out = get_risk_features(
+        data_without_labelling=data,
+        model=model,
+        prototypes_by_layer_map=prototypes_by_layer_map,
+        distance_feature_layer_index=distance_feature_layer_index,
+        consistency_feature_layer_indices=consistency_feature_layer_indices,
+        logits_layer_index=logits_layer_index,
+        batch_size=batch_size,
+        num_augmentations=num_augmentations,
+        augment_repeats_per_transform=augment_repeats_per_transform,
+    )
+    np.savez_compressed(cache_path, **out)
+    print(f'Saved risk features to {cache_path}')
+    return out
+
+
+BINS_BY_FEATURE = {
+    'prediction_entropy': 30,
+    'energy_score': 30,
+    'top12_margin': 30,
+    'dist_pred_class_prototype': 30,
+    'dist_ratio_pred_to_nearest_other_prototype': 30,
+    'dist_layer_inconsistency': 5,
+    'stability_class_change_rate': 15,
+    'stability_max_prob_variance': 30,
+    'stability_mean_kl': 30,
+}
+
+
+def plot_risk_feature_distributions(
+    named_feature_dicts,
+    feature_key,
+    save_dir,
+    bins_by_feature=None,
+    ncols=5,
+):
+    """
+    在一个画布上绘制同一风险特征在不同数据子集上的分布柱状图（直方图），每行 ncols 个子图。
+    named_feature_dicts: [(name, feature_dict_or_None), ...]
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    bins_by_feature = bins_by_feature or {}
+    if feature_key not in bins_by_feature:
+        raise KeyError(f'Missing bins config for feature: {feature_key}')
+    bins = int(bins_by_feature[feature_key])
+
+    n = len(named_feature_dicts)
+    ncols = max(1, int(ncols))
+    nrows = int(np.ceil(n / ncols))
+
+    pooled = []
+    for _, feature_dict in named_feature_dicts:
+        if feature_dict is None or feature_key not in feature_dict:
+            continue
+        vals = np.asarray(feature_dict[feature_key], dtype=np.float32).reshape(-1)
+        vals = vals[np.isfinite(vals)]
+        if vals.size > 0:
+            pooled.append(vals)
+    if pooled:
+        all_vals = np.concatenate(pooled)
+        vmin, vmax = float(np.min(all_vals)), float(np.max(all_vals))
+        if vmin == vmax:
+            vmin, vmax = vmin - 1e-6, vmax + 1e-6
+        bin_edges = np.linspace(vmin, vmax, bins + 1)
+    else:
+        bin_edges = np.linspace(0.0, 1.0, bins + 1)
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.8 * ncols, 2.8 * nrows))
+    axes = np.asarray(axes).reshape(-1)
+    for i, (name, feature_dict) in enumerate(named_feature_dicts):
+        ax = axes[i]
+        if feature_dict is None or feature_key not in feature_dict:
+            ax.text(0.5, 0.5, 'No data', ha='center', va='center', fontsize=9)
+            ax.set_title(name)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            continue
+        vals = np.asarray(feature_dict[feature_key], dtype=np.float32).reshape(-1)
+        vals = vals[np.isfinite(vals)]
+        counts, edges = np.histogram(vals, bins=bin_edges)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        widths = (edges[1:] - edges[:-1]) * 0.9
+        ax.bar(centers, counts, width=widths, alpha=0.85)
+        ax.set_title(name)
+        ax.tick_params(labelsize=8)
+    for j in range(n, len(axes)):
+        axes[j].axis('off')
+
+    fig.suptitle(f'{feature_key} distribution', fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    out_path = save_dir / f'distribution_{feature_key}.png'
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f'Saved plot: {out_path}')
+
+
 if __name__ == "__main__":
-    dataset_name = 'fmnist'
+    data_name = 'fmnist'
     # dataset_name = 'cifar10'
 
-    if dataset_name == 'fmnist':
+    if data_name == 'fmnist':
         model_path = '../models/lenet_fmnist/tf_model.h5'
         cnn_model = tf.keras.models.load_model(model_path)
         x_train, y_train, x_test, y_test = load_fmnist()
         adv_dir = Path('../data/fmnist/adversarial')
-    elif dataset_name == 'cifar10':
+        distance_layer_index = -4
+        consistency_layer_indices = [-10, -8, -6, -4]
+    elif data_name == 'cifar10':
         model_path = '../models/vgg19_cifar10/tf_model.h5'
         cnn_model = tf.keras.models.load_model(model_path)
         x_train, y_train, x_test, y_test = load_cifar10()
         adv_dir = Path('../data/cifar10/adversarial')
+        distance_layer_index = None
+        consistency_layer_indices = None
     else:
         exit()
     if np.asarray(y_train).ndim > 1:
         y_train = np.argmax(y_train, axis=-1)
     if np.asarray(y_test).ndim > 1:
         y_test = np.argmax(y_test, axis=-1)
+    
+    risk_features_cache_dir = (Path(__file__).resolve().parent.parent / 'data' / data_name)
 
     # 主距离层 + 层间一致性层（可按模型结构调整）
-    distance_layer_index = -4
-    consistency_layer_indices = [-8, -6, -4]
     all_prototype_layers = list(dict.fromkeys([distance_layer_index] + consistency_layer_indices))
     prototypes_by_layer = build_or_load_class_prototypes_dict(
         cnn_model,
         train_data=x_train,
         train_labels=y_train,
         layer_indices=all_prototype_layers,
-        dataset_name=dataset_name,
+        dataset_name=data_name,
         batch_size=64,
     )
     print('prototypes_by_layer', {k: v.shape for k, v in prototypes_by_layer.items()})
 
-    risk_features = get_risk_features(
-        x_test,
-        cnn_model,
-        batch_size=16,
-        prototypes_by_layer=prototypes_by_layer,
-        distance_layer_index=distance_layer_index,
-        consistency_layer_indices=consistency_layer_indices,
-    )
-    print(risk_features)
+    y_test_pred = np.argmax(cnn_model.predict(x_test, batch_size=64, verbose=0), axis=-1)
+    correct_mask = (y_test_pred == y_test)
+    correct_x_test = x_test[correct_mask]
+    wrong_x_test = x_test[~correct_mask]
+    print(f'{data_name} -> correct: {len(correct_x_test)}, wrong: {len(wrong_x_test)}')
 
+    if len(correct_x_test) > 0:
+        print('computing correct_x_test risk features')
+        correct_risk_features = build_or_load_risk_features(
+            cache_dir=risk_features_cache_dir,
+            cache_name='risk_features_correct_x_test.npz',
+            data=correct_x_test,
+            model=cnn_model,
+            prototypes_by_layer_map=prototypes_by_layer,
+            distance_feature_layer_index=distance_layer_index,
+            consistency_feature_layer_indices=consistency_layer_indices,
+            batch_size=16,
+        )
+        print('correct_x_test risk features')
+    else:
+        print('correct_x_test is empty, skip risk feature computation')
+        correct_risk_features = None
+
+    if len(wrong_x_test) > 0:
+        print('computing wrong_x_test risk features')
+        wrong_risk_features = build_or_load_risk_features(
+            cache_dir=risk_features_cache_dir,
+            cache_name='risk_features_wrong_x_test.npz',
+            data=wrong_x_test,
+            model=cnn_model,
+            prototypes_by_layer_map=prototypes_by_layer,
+            distance_feature_layer_index=distance_layer_index,
+            consistency_feature_layer_indices=consistency_layer_indices,
+            batch_size=16,
+        )
+        print('wrong_x_test risk features')
+    else:
+        print('wrong_x_test is empty, skip risk feature computation')
+        wrong_risk_features = None
+
+    plot_groups = [
+        ('correct_x_test', correct_risk_features),
+        ('wrong_x_test', wrong_risk_features),
+    ]
+
+    adv_files = sorted(adv_dir.glob('*_adv_data.npy'))
+    if not adv_files:
+        print(f'No files matching *_adv_data.npy under {adv_dir.resolve()}')
+    for adv_path in adv_files:
+        adv_data = np.load(adv_path)
+        adv_prefix = adv_path.name.removesuffix('_adv_data.npy')
+        print(f'{adv_path.name}: shape={getattr(adv_data, "shape", None)}')
+        print('computing adv_data risk features')
+        risk_features = build_or_load_risk_features(
+            cache_dir=risk_features_cache_dir,
+            cache_name=f'risk_features_{adv_prefix}.npz',
+            data=adv_data,
+            model=cnn_model,
+            prototypes_by_layer_map=prototypes_by_layer,
+            distance_feature_layer_index=distance_layer_index,
+            consistency_feature_layer_indices=consistency_layer_indices,
+            batch_size=16,
+        )
+        plot_groups.append((adv_prefix, risk_features))
+
+    first_available = next((d for _, d in plot_groups if d is not None), None)
+    if first_available is not None:
+        plot_dir = risk_features_cache_dir / 'plots'
+        for feature_name in BINS_BY_FEATURE.keys():
+            if feature_name not in first_available:
+                continue
+            plot_risk_feature_distributions(
+                named_feature_dicts=plot_groups,
+                feature_key=feature_name,
+                save_dir=plot_dir,
+                bins_by_feature=BINS_BY_FEATURE,
+                ncols=5,
+            )
+
+    
