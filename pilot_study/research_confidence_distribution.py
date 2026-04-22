@@ -3,8 +3,13 @@ from pathlib import Path
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
+import sys
 
-from load_data import load_mnist, load_fmnist, load_cifar10, load_svhn
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from training_models.load_data import load_mnist, load_fmnist, load_cifar10, load_svhn
 
 
 def show_confidence_distribution(model_checkpoint, data, labels=None, data_name=None):
@@ -84,19 +89,19 @@ def show_confidence_distribution(model_checkpoint, data, labels=None, data_name=
 
 
 if __name__ == '__main__':
-    # dataset_name = 'fmnist'
-    dataset_name = 'cifar10'
+    dataset_name = 'fmnist'
+    # dataset_name = 'cifar10'
 
     if dataset_name == 'fmnist':
-        model_path = './models/lenet_fmnist/tf_model.h5'
+        model_path = '../models/lenet_fmnist/tf_model.h5'
         cnn_model = tf.keras.models.load_model(model_path)
         x_train, y_train, x_test, y_test = load_fmnist()
-        adv_dir = Path('./data/fmnist/adversarial')
+        adv_dir = Path('../data/fmnist/adversarial')
     elif dataset_name == 'cifar10':
-        model_path = './models/vgg19_cifar10/tf_model.h5'
+        model_path = '../models/vgg19_cifar10/tf_model.h5'
         cnn_model = tf.keras.models.load_model(model_path)
         x_train, y_train, x_test, y_test = load_cifar10()
-        adv_dir = Path('./data/cifar10/adversarial')
+        adv_dir = Path('../data/cifar10/adversarial')
     else:
         exit()
     if np.asarray(y_train).ndim > 1:

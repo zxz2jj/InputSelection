@@ -567,10 +567,7 @@ def plot_risk_feature_distributions(
     bins_by_feature=None,
     ncols=5,
 ):
-    """
-    在一个画布上绘制同一风险特征在不同数据子集上的分布柱状图（直方图），每行 ncols 个子图。
-    named_feature_dicts: [(name, feature_dict_or_None), ...]
-    """
+
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -629,9 +626,196 @@ def plot_risk_feature_distributions(
     print(f'Saved plot: {out_path}')
 
 
+def plot_trc_subplots(trc_named_results, save_dir, ncols=5):
+
+    if len(trc_named_results) == 0:
+        return
+
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    n = len(trc_named_results)
+    ncols = max(1, int(ncols))
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.8 * ncols, 2.9 * nrows))
+    axes = np.asarray(axes).reshape(-1)
+
+    subplot_budget_ratios = np.asarray(trc_named_results[0][1]['budget_ratio'], dtype=np.float32).reshape(-1)
+    subplot_budget_ratios = subplot_budget_ratios[np.isfinite(subplot_budget_ratios)]
+    subplot_budget_ratios = np.unique(np.round(subplot_budget_ratios, 6))
+    if subplot_budget_ratios.size == 0:
+        return
+    x_min = min(0.0, float(np.min(subplot_budget_ratios)))
+    x_max = max(1.0, float(np.max(subplot_budget_ratios))) + 1e-3
+
+    for i, (name, subplot_result) in enumerate(trc_named_results):
+        ax = axes[i]
+        x = np.asarray(subplot_result['budget_ratio'], dtype=np.float32)
+        y_trc = np.asarray(subplot_result['trc'], dtype=np.float32)
+        y_error_recall = np.asarray(subplot_result['error_recall'], dtype=np.float32)
+        ax.plot(x, y_trc, marker='o', linewidth=1.8, label='TRC')
+        ax.plot(x, y_error_recall, marker='s', linewidth=1.6, label='Error Recall')
+        ax.set_title(name)
+        ax.set_xlabel('Budget Ratio')
+        ax.set_xticks(np.round(np.arange(0.0, 1.0 + 1e-9, 0.1), 2))
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(0.0, 1.05)
+        ax.grid(alpha=0.25, linestyle='--', linewidth=0.6)
+        ax.legend(fontsize=8, loc='lower right')
+        for idx, (xx, yy) in enumerate(zip(x, y_trc)):
+            if idx % 2 == 0 and np.isfinite(yy):
+                ax.annotate(f'{yy:.2f}', (xx, yy), textcoords='offset points', xytext=(0, -10),
+                            ha='center', fontsize=8)
+
+    for j in range(n, len(axes)):
+        axes[j].axis('off')
+
+    fig.suptitle('TRC curves by combined dataset', fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    out_path = save_dir / 'trc_subplots.png'
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f'Saved plot: {out_path}')
+
+
+def _rank_normalize_average_ignore_nan(values):
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    out = np.full(arr.shape[0], np.nan, dtype=np.float64)
+    valid_mask = np.isfinite(arr)
+    valid_idx = np.where(valid_mask)[0]
+    n_valid = valid_idx.size
+    if n_valid == 0:
+        return out
+    if n_valid == 1:
+        out[valid_idx[0]] = 0.0
+        return out
+
+    v = arr[valid_mask]
+    order = np.argsort(v, kind='mergesort')
+    sorted_vals = v[order]
+    ranks = np.empty(n_valid, dtype=np.float64)
+    i = 0
+    while i < n_valid:
+        j = i + 1
+        while j < n_valid and sorted_vals[j] == sorted_vals[i]:
+            j += 1
+        avg_rank = (i + 1 + j) / 2.0  # average rank for ties (1-based)
+        ranks[order[i:j]] = avg_rank
+        i = j
+    out[valid_mask] = (ranks - 1.0) / (n_valid - 1.0)
+    return out
+
+
+def risk_scoring_function(risk_features, feature_keys=None, sample_indices=None):
+
+    if risk_features is None:
+        raise TypeError('risk_features is None')
+
+    if feature_keys is None:
+        feature_keys = [
+            'prediction_entropy',
+            'energy_score',
+            'top12_margin',
+            'stability_class_change_rate',
+            'stability_max_prob_variance',
+            'stability_mean_kl',
+            'dist_pred_class_prototype',
+            'dist_ratio_pred_to_nearest_other_prototype',
+            'dist_layer_inconsistency',
+        ]
+    feature_keys = [k for k in feature_keys if k in risk_features]
+    if len(feature_keys) == 0:
+        raise ValueError('No valid feature_keys found in risk_features')
+
+    n = np.asarray(risk_features[feature_keys[0]]).reshape(-1).shape[0]
+    for k in feature_keys[1:]:
+        if np.asarray(risk_features[k]).reshape(-1).shape[0] != n:
+            raise ValueError(f'Feature length mismatch: {k}')
+
+    if sample_indices is None:
+        sample_indices = np.arange(n, dtype=np.int64)
+    else:
+        sample_indices = np.asarray(sample_indices).reshape(-1)
+        if sample_indices.shape[0] != n:
+            raise ValueError('sample_indices length mismatch')
+
+    rank_norms = {}
+    for k in feature_keys:
+        rank_norms[k] = _rank_normalize_average_ignore_nan(risk_features[k])
+
+    score_sum = np.zeros(n, dtype=np.float64)
+    valid_cnt = np.zeros(n, dtype=np.int64)
+    for k in feature_keys:
+        rk = rank_norms[k]
+        m = np.isfinite(rk)
+        score_sum[m] += rk[m]
+        valid_cnt[m] += 1
+
+    risk_score = np.full(n, np.nan, dtype=np.float64)
+    nz = valid_cnt > 0
+    risk_score[nz] = score_sum[nz] / valid_cnt[nz]
+
+    out = {
+        'sample_index': sample_indices.astype(np.int64),
+        'risk_score': risk_score.astype(np.float32),
+        'valid_feature_count': valid_cnt.astype(np.int32),
+    }
+    for k in feature_keys:
+        out[f'rank_norm_{k}'] = rank_norms[k].astype(np.float32)
+    return out
+
+
+def compute_trc_by_budget(risk_score, error_mask, budget_ratios):
+    """
+    TRC = discovered_errors / min(budget_count, total_errors)
+    """
+    rs = np.asarray(risk_score, dtype=np.float64).reshape(-1)
+    err = np.asarray(error_mask).reshape(-1).astype(bool)
+    if rs.shape[0] != err.shape[0]:
+        raise ValueError('risk_score and error_mask length mismatch')
+
+    n = rs.shape[0]
+    total_errors = int(np.sum(err))
+    # NaN 分数视为最低风险，排到末尾
+    rs_for_sort = np.where(np.isfinite(rs), rs, -np.inf)
+    order = np.argsort(-rs_for_sort, kind='mergesort')
+
+    out_ratios = []
+    out_budget_counts = []
+    out_discovered_errors = []
+    out_trc = []
+    out_error_recall = []
+    for r in budget_ratios:
+        rr = float(r)
+        if rr <= 0 or rr > 1:
+            raise ValueError(f'budget ratio must be in (0,1], got {rr}')
+        k = int(np.ceil(rr * n))
+        k = max(1, min(k, n))
+        selected = order[:k]
+        discovered = int(np.sum(err[selected]))
+        denom = min(k, total_errors)
+        trc = (discovered / denom) if denom > 0 else np.nan
+        error_recall = (discovered / total_errors) if total_errors > 0 else np.nan
+
+        out_ratios.append(rr)
+        out_budget_counts.append(k)
+        out_discovered_errors.append(discovered)
+        out_trc.append(trc)
+        out_error_recall.append(error_recall)
+
+    return {
+        'budget_ratio': np.asarray(out_ratios, dtype=np.float32),
+        'budget_count': np.asarray(out_budget_counts, dtype=np.int32),
+        'discovered_errors': np.asarray(out_discovered_errors, dtype=np.int32),
+        'total_errors': np.int32(total_errors),
+        'trc': np.asarray(out_trc, dtype=np.float32),
+        'error_recall': np.asarray(out_error_recall, dtype=np.float32),
+    }
+
+
 if __name__ == "__main__":
-    data_name = 'fmnist'
-    # dataset_name = 'cifar10'
+    # data_name = 'fmnist'
+    data_name = 'cifar10'
 
     if data_name == 'fmnist':
         model_path = '../models/lenet_fmnist/tf_model.h5'
@@ -645,8 +829,8 @@ if __name__ == "__main__":
         cnn_model = tf.keras.models.load_model(model_path)
         x_train, y_train, x_test, y_test = load_cifar10()
         adv_dir = Path('../data/cifar10/adversarial')
-        distance_layer_index = None
-        consistency_layer_indices = None
+        distance_layer_index = -5
+        consistency_layer_indices = [-19, -15, -11, -5]
     else:
         exit()
     if np.asarray(y_train).ndim > 1:
@@ -747,4 +931,51 @@ if __name__ == "__main__":
                 ncols=5,
             )
 
-    
+    # 对每个合并集（correct_x_test + wrong_x_test / 某个 adv 数据）按预算计算 TRC
+    if len(correct_x_test) > 0:
+        trc_budget_ratios = np.round(np.arange(0.05, 1.001, 0.05), 2).tolist()
+        trc_plot_groups = []
+        combined_eval_groups = []
+
+        if len(wrong_x_test) > 0:
+            combined_eval_groups.append(('wrong_x_test', wrong_x_test))
+
+        for adv_path in adv_files:
+            adv_data = np.load(adv_path)
+            adv_prefix = adv_path.name.removesuffix('_adv_data.npy')
+            combined_eval_groups.append((adv_prefix, adv_data))
+
+        for group_name, group_data in combined_eval_groups:
+            combined_data = np.concatenate([correct_x_test, group_data], axis=0)
+            combined_risk_features = build_or_load_risk_features(
+                cache_dir=risk_features_cache_dir,
+                cache_name=f'risk_features_combined_correct_{group_name}.npz',
+                data=combined_data,
+                model=cnn_model,
+                prototypes_by_layer_map=prototypes_by_layer,
+                distance_feature_layer_index=distance_layer_index,
+                consistency_feature_layer_indices=consistency_layer_indices,
+                batch_size=16,
+            )
+            risk_scores = risk_scoring_function(
+                combined_risk_features,
+                sample_indices=np.arange(len(combined_data), dtype=np.int64),
+            )
+            combined_error_mask = np.concatenate([
+                np.zeros(len(correct_x_test), dtype=bool),
+                np.ones(len(group_data), dtype=bool),
+            ])
+            trc_result = compute_trc_by_budget(
+                risk_score=risk_scores['risk_score'],
+                error_mask=combined_error_mask,
+                budget_ratios=trc_budget_ratios,
+            )
+            trc_plot_groups.append((group_name, trc_result))
+            print(f'TRC ({group_name}) -> budgets={trc_result["budget_count"]}, trc={trc_result["trc"]}')
+
+        if trc_plot_groups:
+            plot_trc_subplots(
+                trc_named_results=trc_plot_groups,
+                save_dir=risk_features_cache_dir / 'plots',
+                ncols=4,
+            )

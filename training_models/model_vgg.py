@@ -77,11 +77,13 @@ class VGGModel(object):
         model.add(tf.keras.layers.MaxPooling2D(pool_size=(2, 2)))
 
         model.add(tf.keras.layers.Conv2D(512, (3, 3), padding='same', kernel_regularizer=tf.keras.regularizers.l2(weight_decay)))
+        # -19
         model.add(tf.keras.layers.Activation('relu'))
         model.add(tf.keras.layers.BatchNormalization())
         model.add(tf.keras.layers.Dropout(0.4))
 
         model.add(tf.keras.layers.Conv2D(512, (3, 3), padding='same', kernel_regularizer=tf.keras.regularizers.l2(weight_decay)))
+        # -15
         model.add(tf.keras.layers.Activation('relu'))
         model.add(tf.keras.layers.BatchNormalization())
         model.add(tf.keras.layers.Dropout(0.4))
@@ -120,7 +122,7 @@ class VGGModel(object):
 
     def show_model(self):
         model = tf.keras.models.load_model(self.model_save_path+self.model_name)
-        # model.summary()
+        model.summary()
         print("train dataset:")
         print(self.train_data.shape, self.train_label.shape)
         model.evaluate(self.train_data, self.train_label, verbose=2)

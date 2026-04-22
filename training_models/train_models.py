@@ -49,13 +49,13 @@ if __name__ == "__main__":
     # save_path = '../models/lenet_mnist/'
     # save_name = 'tf_model.h5'
 
-    dataset = 'fmnist'
-    save_path = '../models/lenet_fmnist/'
-    save_name = f'tf_model.h5'
-
-    # dataset = 'cifar10'
-    # save_path = '../models/vgg19_cifar10/'
+    # dataset = 'fmnist'
+    # save_path = '../models/lenet_fmnist/'
     # save_name = f'tf_model.h5'
+
+    dataset = 'cifar10'
+    save_path = '../models/vgg19_cifar10/'
+    save_name = f'tf_model.h5'
 
     # dataset = 'svhn'
     # save_path = '../models/resnet18_svhn/'
