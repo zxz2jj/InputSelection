@@ -146,6 +146,30 @@ def _batch_distance_risk_features(hid_flat, pred, prototypes):
     return dist_pred_proto.astype(np.float32), dist_ratio.astype(np.float32)
 
 
+def _batch_nearest_non_pred_class_features(hid_flat, pred, prototypes):
+
+    hid_flat = np.asarray(hid_flat, dtype=np.float64)
+    pred = np.asarray(pred, dtype=np.int64).reshape(-1)
+    prototypes = np.asarray(prototypes, dtype=np.float64)
+    B = hid_flat.shape[0]
+    C = prototypes.shape[0]
+    valid_proto = ~np.isnan(prototypes).any(axis=1)
+
+    nearest_non_pred_class = np.full(B, -1, dtype=np.int64)
+    for i in range(B):
+        p = int(pred[i])
+        d_all = np.linalg.norm(prototypes - hid_flat[i], axis=1)
+        candidate_mask = valid_proto & (np.arange(C, dtype=np.int64) != p)
+        candidate_idx = np.where(candidate_mask)[0]
+        if candidate_idx.size == 0:
+            continue
+        cand_dist = d_all[candidate_idx]
+        order = np.argsort(cand_dist, kind='mergesort')
+        best_idx = int(candidate_idx[order[0]])
+        nearest_non_pred_class[i] = best_idx
+    return nearest_non_pred_class
+
+
 # 可以与上一个函数合并，优化时间复杂度
 def _batch_pred_class_is_min_distance(hid_flat, pred, prototypes):
     """
@@ -373,6 +397,11 @@ def get_risk_features(data_without_labelling,
     dist_pred_proto_list = []
     dist_ratio_list = []
     dist_layer_inconsistency_list = []
+    non_pred_top1_class_list = []
+    non_pred_top1_prob_list = []
+    non_pred_top2_prob_list = []
+    aug_non_pred_mode_class_list = []
+    nearest_non_pred_class_by_layer = {idx: [] for idx in consistency_feature_layer_indices}
 
     consistency_feature_layer_indices = [int(i) for i in consistency_feature_layer_indices]
     hidden_layer_indices = list(dict.fromkeys([int(distance_feature_layer_index)] + consistency_feature_layer_indices))
@@ -426,6 +455,20 @@ def get_risk_features(data_without_labelling,
 
         pred_classes = tf.argmax(probs, axis=-1)
         pred_np = pred_classes.numpy()
+        num_classes = int(probs.shape[-1])
+
+        probs_np = probs.numpy()
+        sample_idx = np.arange(probs_np.shape[0], dtype=np.int64)
+        probs_non_pred = probs_np.copy()
+        probs_non_pred[sample_idx, pred_np] = -np.inf
+        non_pred_order = np.argsort(probs_non_pred, axis=1)
+        non_pred_top1_class = non_pred_order[:, -1].astype(np.int64)
+        non_pred_top1_prob = probs_np[sample_idx, non_pred_top1_class].astype(np.float32)
+        if num_classes >= 3:
+            non_pred_top2_class = non_pred_order[:, -2].astype(np.int64)
+            non_pred_top2_prob = probs_np[sample_idx, non_pred_top2_class].astype(np.float32)
+        else:
+            non_pred_top2_prob = np.full(probs_np.shape[0], np.nan, dtype=np.float32)
 
         hid_flat_by_layer = {}
         for idx, hid in zip(hidden_layer_indices, hid_outs):
@@ -452,6 +495,12 @@ def get_risk_features(data_without_labelling,
                     hidden_prototypes[idx],
                 ),
             )
+            near_cls = _batch_nearest_non_pred_class_features(
+                hid_flat_by_layer[idx],
+                pred_np,
+                hidden_prototypes[idx],
+            )
+            nearest_non_pred_class_by_layer[idx].append(near_cls.reshape(-1))
         layer_consistency_flags = np.stack(layer_consistency_flags, axis=1)
         inter_layer_inconsistency = 1.0 - np.mean(layer_consistency_flags, axis=1)
 
@@ -470,6 +519,18 @@ def get_risk_features(data_without_labelling,
             tf.cast(tf.not_equal(pred_orig, aug_preds), tf.float32),
             axis=1,
         )
+        aug_preds_np = aug_preds.numpy().astype(np.int64)
+        pred_col = pred_np[:, None]
+        non_pred_mask = (aug_preds_np != pred_col)
+        counts_all = np.zeros((aug_preds_np.shape[0], num_classes), dtype=np.int64)
+        for c in range(num_classes):
+            counts_all[:, c] = np.sum((aug_preds_np == c) & non_pred_mask, axis=1)
+        aug_non_pred_mode_class = np.argmax(counts_all, axis=1).astype(np.int64)
+        max_counts = np.max(counts_all, axis=1, keepdims=True)
+        tie_for_top = np.sum(counts_all == max_counts, axis=1) > 1
+        aug_non_pred_mode_class[tie_for_top] = -1
+        no_non_pred_vote = np.sum(non_pred_mask, axis=1) == 0
+        aug_non_pred_mode_class[no_non_pred_vote] = -1
 
         max_per_aug = tf.reduce_max(aug_probs, axis=-1)
         stability_max_prob_variance = tf.math.reduce_variance(max_per_aug, axis=1)
@@ -490,6 +551,10 @@ def get_risk_features(data_without_labelling,
         dist_pred_proto_list.append(dp.reshape(-1))
         dist_ratio_list.append(dr.reshape(-1))
         dist_layer_inconsistency_list.append(inter_layer_inconsistency.astype(np.float32).reshape(-1))
+        non_pred_top1_class_list.append(non_pred_top1_class.reshape(-1))
+        non_pred_top1_prob_list.append(non_pred_top1_prob.reshape(-1))
+        non_pred_top2_prob_list.append(non_pred_top2_prob.reshape(-1))
+        aug_non_pred_mode_class_list.append(aug_non_pred_mode_class.reshape(-1))
 
     out = {
         'prediction_entropy': np.concatenate(entropy_list),
@@ -502,7 +567,13 @@ def get_risk_features(data_without_labelling,
         'dist_pred_class_prototype': np.concatenate(dist_pred_proto_list),
         'dist_ratio_pred_to_nearest_other_prototype': np.concatenate(dist_ratio_list),
         'dist_layer_inconsistency': np.concatenate(dist_layer_inconsistency_list),
+        'non_pred_top1_class': np.concatenate(non_pred_top1_class_list).astype(np.int64),
+        'non_pred_top1_prob': np.concatenate(non_pred_top1_prob_list).astype(np.float32),
+        'non_pred_top2_prob': np.concatenate(non_pred_top2_prob_list).astype(np.float32),
+        'aug_non_pred_mode_class': np.concatenate(aug_non_pred_mode_class_list).astype(np.int64),
     }
+    for idx in consistency_feature_layer_indices:
+        out[f'nearest_non_pred_class_layer_{idx}'] = np.concatenate(nearest_non_pred_class_by_layer[idx]).astype(np.int64)
     return out
 
 
@@ -814,7 +885,7 @@ def compute_trc_by_budget(risk_score, error_mask, budget_ratios):
 
 
 if __name__ == "__main__":
-    # data_name = 'fmnist'
+    # data_name = 'fmnist'你dni ju
     data_name = 'cifar10'
 
     if data_name == 'fmnist':
@@ -939,7 +1010,6 @@ if __name__ == "__main__":
 
         if len(wrong_x_test) > 0:
             combined_eval_groups.append(('wrong_x_test', wrong_x_test))
-
         for adv_path in adv_files:
             adv_data = np.load(adv_path)
             adv_prefix = adv_path.name.removesuffix('_adv_data.npy')
