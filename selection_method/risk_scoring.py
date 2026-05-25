@@ -885,7 +885,7 @@ def compute_trc_by_budget(risk_score, error_mask, budget_ratios):
 
 
 if __name__ == "__main__":
-    # data_name = 'fmnist'你dni ju
+    # data_name = 'fmnist'
     data_name = 'cifar10'
 
     if data_name == 'fmnist':

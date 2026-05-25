@@ -215,6 +215,167 @@ def snorkel_analysis(labels_list, cardinality, topk=2):
     return {'probs': probs, 'topk_idx': topk_idx, 'topk_prob': topk_prob}
 
 
+def compute_lf_labels_from_risk_features(
+    data,
+    risk_features,
+    assist_model,
+    consistency_layer_indices,
+    *,
+    gap_threshold=0.05,
+):
+    """
+    由 risk_features、assist_model 与 data 计算 LF1–LF4，与 __main__ 中对抗集流程一致。
+    返回四个长度均为 len(data) 的整型标签向量。
+    """
+    rf = risk_features
+    lf1_labels = lf_non_pred_softmax_gap(
+        non_pred_top1_class=rf['non_pred_top1_class'],
+        non_pred_top1_prob=rf['non_pred_top1_prob'],
+        non_pred_top2_prob=rf['non_pred_top2_prob'],
+        gap_threshold=gap_threshold,
+    )
+    lf2_labels = lf_multi_layer_nearest_non_pred_consensus(
+        feature_map=rf,
+        layer_indices=consistency_layer_indices,
+    )
+    lf3_labels = lf_external_model_non_pred_max(
+        external_model=assist_model,
+        data=data,
+        pred_classes=rf['pred_classes'],
+    )
+    lf4_labels = lf_augmented_non_pred_mode(
+        aug_non_pred_mode_class=rf['aug_non_pred_mode_class'],
+    )
+    n = len(data)
+    for name, arr in (
+        ('LF1', lf1_labels),
+        ('LF2', lf2_labels),
+        ('LF3', lf3_labels),
+        ('LF4', lf4_labels),
+    ):
+        if len(arr) != n:
+            raise ValueError(f'{name} length {len(arr)} != len(data)={n}')
+    return lf1_labels, lf2_labels, lf3_labels, lf4_labels
+
+
+def build_snorkel_result_from_risk_features(
+    data,
+    risk_features,
+    assist_model,
+    consistency_layer_indices,
+    cardinality,
+    *,
+    gap_threshold=0.05,
+    topk=2,
+):
+
+    lf1_labels, lf2_labels, lf3_labels, lf4_labels = compute_lf_labels_from_risk_features(
+        data,
+        risk_features,
+        assist_model,
+        consistency_layer_indices,
+        gap_threshold=gap_threshold,
+    )
+    snorkel_out = snorkel_analysis(
+        [lf1_labels, lf2_labels, lf3_labels, lf4_labels],
+        cardinality,
+        topk=topk,
+    )
+    return {
+        **snorkel_out,
+        'lf1_labels': lf1_labels,
+        'lf2_labels': lf2_labels,
+        'lf3_labels': lf3_labels,
+        'lf4_labels': lf4_labels,
+    }
+
+
+_SNORKEL_RESULT_KEYS = ('probs', 'topk_idx', 'topk_prob')
+_LF_LABEL_KEYS = ('lf1_labels', 'lf2_labels', 'lf3_labels', 'lf4_labels')
+
+
+def _assert_snorkel_cache_matches(z, n_pool, cardinality, gap_threshold, topk, consistency_layer_indices):
+    if int(z['n_pool']) != int(n_pool):
+        raise ValueError(
+            f'snorkel cache n_pool={int(z["n_pool"])} != current pool size {n_pool}',
+        )
+    if int(z['cardinality']) != int(cardinality):
+        raise ValueError('snorkel cache cardinality mismatch')
+    if not np.isclose(float(z['gap_threshold']), float(gap_threshold), rtol=0.0, atol=1e-6):
+        raise ValueError('snorkel cache gap_threshold mismatch')
+    if int(z['topk']) != int(topk):
+        raise ValueError('snorkel cache topk mismatch')
+    cached_layers = np.asarray(z['consistency_layer_indices'], dtype=np.int64).reshape(-1)
+    expected_layers = np.asarray(consistency_layer_indices, dtype=np.int64).reshape(-1)
+    if not np.array_equal(cached_layers, expected_layers):
+        raise ValueError('snorkel cache consistency_layer_indices mismatch')
+
+
+def build_or_load_snorkel_result_from_risk_features(
+    cache_dir,
+    cache_name,
+    data,
+    risk_feature_map,
+    lf_assist_model,
+    lf_layer_indices,
+    cardinality,
+    *,
+    gap_threshold=0.05,
+    topk=2,
+    force_recompute=False,
+):
+    n_pool = len(data)
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / cache_name
+
+    if cache_path.is_file() and not force_recompute:
+        z = np.load(cache_path)
+        meta_keys = {'n_pool', 'cardinality', 'gap_threshold', 'topk', 'consistency_layer_indices'}
+        if meta_keys.issubset(z.files):
+            try:
+                _assert_snorkel_cache_matches(
+                    z, n_pool, cardinality, gap_threshold, topk, lf_layer_indices,
+                )
+                out = {k: np.asarray(z[k]) for k in _SNORKEL_RESULT_KEYS}
+                if all(k in z.files for k in _LF_LABEL_KEYS):
+                    for k in _LF_LABEL_KEYS:
+                        out[k] = np.asarray(z[k])
+                print(f'Loaded snorkel result from {cache_path}')
+                return out
+            except ValueError as exc:
+                print(f'Snorkel cache stale ({exc}), recomputing...')
+        else:
+            print(f'Snorkel cache missing metadata in {cache_path}, recomputing...')
+
+    out = build_snorkel_result_from_risk_features(
+        data,
+        risk_feature_map,
+        lf_assist_model,
+        lf_layer_indices,
+        cardinality,
+        gap_threshold=gap_threshold,
+        topk=topk,
+    )
+    np.savez_compressed(
+        cache_path,
+        probs=out['probs'],
+        topk_idx=out['topk_idx'],
+        topk_prob=out['topk_prob'],
+        lf1_labels=out['lf1_labels'],
+        lf2_labels=out['lf2_labels'],
+        lf3_labels=out['lf3_labels'],
+        lf4_labels=out['lf4_labels'],
+        n_pool=np.int32(n_pool),
+        cardinality=np.int32(cardinality),
+        gap_threshold=np.float32(gap_threshold),
+        topk=np.int32(topk),
+        consistency_layer_indices=np.asarray(lf_layer_indices, dtype=np.int64),
+    )
+    print(f'Saved snorkel result to {cache_path}')
+    return out
+
+
 def snorkel_distribution_metrics(snorkel_result, true_labels, topk):
     """
     topk 准确率: 真实标签落在 Snorkel 预测分布的 top-k 类中。
@@ -278,8 +439,8 @@ def plot_snorkel_distribution_metrics(adv_snorkel_stats, data_name, topk):
 
 if __name__ == "__main__":
 
-    data_name = 'fmnist'
-    # data_name = 'cifar10'
+    # data_name = 'fmnist'
+    data_name = 'cifar10'
 
     if data_name == 'fmnist':
         model_path = '../models/lenet_fmnist/tf_model.h5'
@@ -336,64 +497,41 @@ if __name__ == "__main__":
         z = np.load(rf_path)
         risk_features = {k: np.asarray(z[k]) for k in z.files}
         clean_labels = _as_1d_int(np.load(clean_label_path), 'clean_labels')
-
-        lf1_labels = lf_non_pred_softmax_gap(
-            non_pred_top1_class=risk_features['non_pred_top1_class'],
-            non_pred_top1_prob=risk_features['non_pred_top1_prob'],
-            non_pred_top2_prob=risk_features['non_pred_top2_prob'],
-            gap_threshold=0.05,
-        )
-
-        lf2_labels = lf_multi_layer_nearest_non_pred_consensus(
-            feature_map=risk_features,
-            layer_indices=consistency_layer_indices,
-        )
-
-        lf3_labels = lf_external_model_non_pred_max(
-            external_model=assist_model,
-            data=adv_data,
-            pred_classes=risk_features['pred_classes'],
-        )
-
-        lf4_labels = lf_augmented_non_pred_mode(
-            aug_non_pred_mode_class=risk_features['aug_non_pred_mode_class'],
-        )
-
-        if not (len(lf1_labels) == len(lf2_labels) == len(lf3_labels) == len(lf4_labels) == len(clean_labels)):
-            print(f'Skip {adv_prefix}: label length mismatch with clean labels')
+        if len(clean_labels) != len(adv_data):
+            print(f'Skip {adv_prefix}: clean_labels length mismatch with adv_data')
             continue
 
-        lf_stats = {
-            'LF1': _lf_metrics(lf1_labels, clean_labels),
-            'LF2': _lf_metrics(lf2_labels, clean_labels),
-            'LF3': _lf_metrics(lf3_labels, clean_labels),
-            'LF4': _lf_metrics(lf4_labels, clean_labels),
-        }
-        adv_metrics.append((adv_prefix, lf_stats))
+        try:
+            snorkel_result = build_or_load_snorkel_result_from_risk_features(
+                cache_dir=risk_feature_dir,
+                cache_name=f'snorkel_result_{adv_prefix}.npz',
+                data=adv_data,
+                risk_feature_map=risk_features,
+                lf_assist_model=assist_model,
+                lf_layer_indices=consistency_layer_indices,
+                cardinality=n_labels,
+                gap_threshold=0.05,
+                topk=snorkel_topk,
+            )
+        except ValueError as e:
+            print(f'Skip {adv_prefix}: {e}')
+            continue
 
-        print(
-            f'{adv_prefix}: '
-            f'LF1(abstain={lf_stats["LF1"][0]:.3f}, acc={lf_stats["LF1"][1]:.3f}), '
-            f'LF2(abstain={lf_stats["LF2"][0]:.3f}, acc={lf_stats["LF2"][1]:.3f}), '
-            f'LF3(abstain={lf_stats["LF3"][0]:.3f}, acc={lf_stats["LF3"][1]:.3f}), '
-            f'LF4(abstain={lf_stats["LF4"][0]:.3f}, acc={lf_stats["LF4"][1]:.3f})',
-        )
-
-        snorkel_result = snorkel_analysis(
-            [lf1_labels, lf2_labels, lf3_labels, lf4_labels],
-            n_labels,
-            topk=snorkel_topk,
-        )
-        snorkel_out_dir = Path(f'../data/{data_name}')
-        snorkel_out_dir.mkdir(parents=True, exist_ok=True)
-        snorkel_out_path = snorkel_out_dir / f'snorkel_result_{adv_prefix}.npz'
-        np.savez_compressed(
-            snorkel_out_path,
-            probs=snorkel_result['probs'],
-            topk_idx=snorkel_result['topk_idx'],
-            topk_prob=snorkel_result['topk_prob'],
-        )
-        print(f'Saved snorkel result to: {snorkel_out_path.resolve()}')
+        if all(k in snorkel_result for k in _LF_LABEL_KEYS):
+            lf_stats = {
+                'LF1': _lf_metrics(snorkel_result['lf1_labels'], clean_labels),
+                'LF2': _lf_metrics(snorkel_result['lf2_labels'], clean_labels),
+                'LF3': _lf_metrics(snorkel_result['lf3_labels'], clean_labels),
+                'LF4': _lf_metrics(snorkel_result['lf4_labels'], clean_labels),
+            }
+            adv_metrics.append((adv_prefix, lf_stats))
+            print(
+                f'{adv_prefix}: '
+                f'LF1(abstain={lf_stats["LF1"][0]:.3f}, acc={lf_stats["LF1"][1]:.3f}), '
+                f'LF2(abstain={lf_stats["LF2"][0]:.3f}, acc={lf_stats["LF2"][1]:.3f}), '
+                f'LF3(abstain={lf_stats["LF3"][0]:.3f}, acc={lf_stats["LF3"][1]:.3f}), '
+                f'LF4(abstain={lf_stats["LF4"][0]:.3f}, acc={lf_stats["LF4"][1]:.3f})',
+            )
 
         t_topk_acc, mean_p_true = snorkel_distribution_metrics(
             snorkel_result,
