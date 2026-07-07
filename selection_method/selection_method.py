@@ -144,22 +144,6 @@ def build_selection_storage_and_attributes(
     return storage_out, attributes_out
 
 
-def apply_risk_score_power_transform(risk_out, exponent=2.0):
-    """
-    对 risk_out['risk_score'] 做幂变换，默认平方以压低较小分数、拉大高低分差距。
-    非有限值保持不变。
-    """
-    exp = float(exponent)
-    if exp <= 0.0:
-        raise ValueError(f'risk_score power exponent must be > 0, got {exp}')
-    out = dict(risk_out)
-    rs = np.asarray(out['risk_score'], dtype=np.float64).copy()
-    finite = np.isfinite(rs)
-    rs[finite] = np.power(np.maximum(rs[finite], 0.0), exp)
-    out['risk_score'] = rs.astype(np.float32, copy=False)
-    return out
-
-
 def _default_greedy_config():
     return {
         'alpha': 0.5,
@@ -168,25 +152,24 @@ def _default_greedy_config():
         'distance_metric': 'cosine',
         'eps': 1e-12,
         'filter_self_type': True,
+        'risk_gate_power': 2.0,
     }
 
 
 def build_fault_type_contributions(attribute_records, filter_self_type=True):
     """
-    g_e1(x) = risk_score * pseudo_p1,  e1 = (pseudo_src1 -> prediction)
-    g_e2(x) = risk_score * pseudo_p2,  e2 = (pseudo_src2 -> prediction)
+    g_e(x) = p(x)：伪标注错误类型 e 的概率（Snorkel top-k 概率），不再乘以 risk_score。
     """
     sample_to_fault_types = {}
     fault_type_to_samples = defaultdict(list)
 
     for rec in attribute_records:
         sid = int(rec['idx'])
-        r = float(rec['risk_score'])
         pred = int(rec['prediction'])
         top2 = rec['top2_soft_pseudo_labelling']
         candidates = [
-            ((int(top2[0][0]), pred), r * float(top2[0][1])),
-            ((int(top2[1][0]), pred), r * float(top2[1][1])),
+            ((int(top2[0][0]), pred), float(top2[0][1])),
+            ((int(top2[1][0]), pred), float(top2[1][1])),
         ]
         pairs = []
         for fault_type, g in candidates:
@@ -316,6 +299,13 @@ def _replay_min_dist_updates(greedy_state, greedy_cfg):
         _update_min_dist_after_pick(greedy_state, pick_id, greedy_cfg)
 
 
+def _risk_gate_factor(risk_score, power):
+    r = float(risk_score)
+    if not np.isfinite(r):
+        return 0.0
+    return float(np.power(max(0.0, r), float(power)))
+
+
 def normalize_candidate_scores(raw_scores, eps=1e-12):
     arr = np.asarray(raw_scores, dtype=np.float64)
     if arr.size == 0:
@@ -399,6 +389,13 @@ def _assert_greedy_run_cache_matches(z, greedy_cfg, selection_ratio, n_pool):
         raise ValueError('greedy run cache filter_self_type mismatch')
     if str(z['distance_metric'].item()) != str(merged['distance_metric']):
         raise ValueError('greedy run cache distance_metric mismatch')
+    if not np.isclose(
+        float(z['risk_gate_power']),
+        float(merged['risk_gate_power']),
+        rtol=0.0,
+        atol=1e-6,
+    ):
+        raise ValueError('greedy run cache risk_gate_power mismatch')
 
 
 def _greedy_state_from_cached_run(greedy_order, attribute_records, greedy_cfg, cache_arrays):
@@ -469,6 +466,7 @@ def build_or_load_greedy_run(
         phi_mode=np.array(merged_cfg['phi_mode']),
         filter_self_type=np.array(merged_cfg['filter_self_type']),
         distance_metric=np.array(merged_cfg['distance_metric']),
+        risk_gate_power=np.float32(merged_cfg['risk_gate_power']),
         score_log=score_log_arr,
     )
     print(f'Saved greedy run to {cache_path}')
@@ -477,8 +475,9 @@ def build_or_load_greedy_run(
 
 def greedy_select(attribute_records, selection_ratio, greedy_cfg=None):
     """
-    全局贪心选择：每轮在剩余候选上计算覆盖增益与类型内 hidden 新颖性，
-    分别 min-max 归一化后按 Delta = alpha*CovNorm + (1-alpha)*NovNorm 选最大。
+    全局贪心选择：覆盖/多样性基于伪标注类型概率 g_e(x)=p_e(x)；
+    CovNorm、NovNorm 仅对候选池 min-max 归一化后加权求和，再经风险门控：
+    Delta(x|S) = r(x)^risk_gate_power * (alpha*CovNorm + (1-alpha)*NovNorm)。
     selection_ratio: (0, 1] 的选择比例，实际个数为 ceil(ratio * len(attribute_records))，
         并限制在 [1, n]。
     返回 (chosen_ids, greedy_state)。
@@ -486,6 +485,8 @@ def greedy_select(attribute_records, selection_ratio, greedy_cfg=None):
     greedy_cfg = _resolve_greedy_cfg(greedy_cfg)
     if not 0.0 <= greedy_cfg['alpha'] <= 1.0:
         raise ValueError('alpha must be in [0, 1]')
+    if float(greedy_cfg['risk_gate_power']) <= 0.0:
+        raise ValueError('risk_gate_power must be > 0')
 
     n_pool = len(attribute_records)
     if n_pool == 0:
@@ -517,7 +518,18 @@ def greedy_select(attribute_records, selection_ratio, greedy_cfg=None):
         )
         cov_norm = normalize_candidate_scores(cov_raw, eps=greedy_cfg['eps'])
         nov_norm = normalize_candidate_scores(nov_raw, eps=greedy_cfg['eps'])
-        score_delta = greedy_cfg['alpha'] * cov_norm + (1.0 - greedy_cfg['alpha']) * nov_norm
+        combined_norm = (
+            greedy_cfg['alpha'] * cov_norm + (1.0 - greedy_cfg['alpha']) * nov_norm
+        )
+        gate_power = float(greedy_cfg['risk_gate_power'])
+        risk_gate = np.array(
+            [
+                _risk_gate_factor(greedy_state['risk_by_sample'].get(cid, 0.0), gate_power)
+                for cid in pool_candidates
+            ],
+            dtype=np.float64,
+        )
+        score_delta = risk_gate * combined_norm
 
         best_idx = max(
             range(len(pool_candidates)),
@@ -534,6 +546,9 @@ def greedy_select(attribute_records, selection_ratio, greedy_cfg=None):
             'nov_raw': float(nov_raw[best_idx]),
             'cov_norm': float(cov_norm[best_idx]),
             'nov_norm': float(nov_norm[best_idx]),
+            'combined_norm': float(combined_norm[best_idx]),
+            'risk_gate': float(risk_gate[best_idx]),
+            'risk_score': float(greedy_state['risk_by_sample'].get(pick_id, 0.0)),
             'delta': float(score_delta[best_idx]),
             'fault_types': [ft for ft, _ in fault_info],
             'g_values': [g for _, g in fault_info],
@@ -572,16 +587,20 @@ def real_error_type_universe_from_storage(storage_rows):
     return universe
 
 
-def real_error_types_covered_in_prefix(chosen_prefix, sample_to_fault_types, real_universe):
+def real_error_types_covered_in_prefix(chosen_prefix, storage_rows, real_universe):
     """
-    已选前缀上：取伪标注 fault_type，仅保留落在 real_universe 内的类型。
+    Count real fault types covered by a selected prefix. A type is counted only
+    when the selected sample itself is truly mispredicted.
     """
+    rows_by_id = {int(row['idx']): row for row in storage_rows}
     discovered = set()
     for sid in chosen_prefix:
-        for fault_type, _ in sample_to_fault_types.get(int(sid), []):
-            ft = (int(fault_type[0]), int(fault_type[1]))
-            if ft in real_universe:
-                discovered.add(ft)
+        row = rows_by_id.get(int(sid))
+        if row is None or not row['is_wrongly_predicted']:
+            continue
+        ft = (int(row['clean_label']), int(row['prediction']))
+        if ft in real_universe:
+            discovered.add(ft)
     return discovered
 
 
@@ -592,9 +611,9 @@ def compute_greedy_selection_curves(
     budget_ratios=None,
 ):
     """
-    沿贪心选样顺序 greedy_order 的前缀，在各预算比例下计算 TRC、error_recall、
-    真实错误类型 (clean_label, prediction) 的覆盖数量及占全池该类型集合的比例。
-    覆盖统计：伪标注 fault_type 须落在全池真实错误类型集合内才计入。
+    Evaluate prefixes of the greedy order. Error discovery uses the true error
+    mask, and fault-type coverage counts only selected samples that are truly
+    mispredicted, using their real (clean_label, prediction) type.
     """
     if budget_ratios is None:
         budget_ratios = default_greedy_budget_ratios()
@@ -625,9 +644,7 @@ def compute_greedy_selection_curves(
         denom = min(k, total_errors)
         trc = (discovered / denom) if denom > 0 else np.nan
         error_recall = (discovered / total_errors) if total_errors > 0 else np.nan
-        discovered_types = real_error_types_covered_in_prefix(
-            prefix, sample_to_fault_types, real_universe,
-        )
+        discovered_types = real_error_types_covered_in_prefix(prefix, storage_rows, real_universe)
         ft_count = len(discovered_types)
         ft_ratio = (ft_count / total_fault_types) if total_fault_types > 0 else np.nan
 
@@ -761,8 +778,8 @@ def plot_greedy_fault_type_subplots(named_results, save_dir, ncols=4):
 
 
 if __name__ == '__main__':
-    # data_name = 'fmnist'
-    data_name = 'cifar10'
+    data_name = 'fmnist'
+    # data_name = 'cifar10'
 
     if data_name == 'fmnist':
         model_path = '../models/lenet_fmnist/tf_model.h5'
@@ -809,15 +826,15 @@ if __name__ == '__main__':
     wrong_x_test = x_test[~correct_mask]
     print(f'{data_name} -> correct: {len(correct_x_test)}, wrong: {len(wrong_x_test)}')
 
-    # adv_files = sorted(adv_dir.glob('*_adv_data.npy'))
-    quick_eval_adv_prefixes = ('ba',  'cw_l2', 'brightness', 'rotation')
-    adv_files = []
-    for prefix in quick_eval_adv_prefixes:
-        adv_path = adv_dir / f'{prefix}_adv_data.npy'
-        if adv_path.is_file():
-            adv_files.append(adv_path)
-        else:
-            print(f'Warning: missing adversarial data {adv_path.name}, skip')
+    adv_files = sorted(adv_dir.glob('*_adv_data.npy'))
+    # quick_eval_adv_prefixes = ('ba',  'cw_l2', 'brightness', 'rotation')
+    # adv_files = []
+    # for prefix in quick_eval_adv_prefixes:
+    #     adv_path = adv_dir / f'{prefix}_adv_data.npy'
+    #     if adv_path.is_file():
+    #         adv_files.append(adv_path)
+    #     else:
+    #         print(f'Warning: missing adversarial data {adv_path.name}, skip')
 
     if len(correct_x_test) > 0:
         combined_eval_groups = []
@@ -831,8 +848,7 @@ if __name__ == '__main__':
         correct_clean_labels = y_test[correct_mask].astype(np.int64, copy=False)
         wrong_clean_labels = y_test[~correct_mask].astype(np.int64, copy=False)
 
-        greedy_config = {'alpha': 0.5, 'phi_mode': 'sqrt'}
-        risk_score_power = 3.0
+        greedy_config = {'alpha': 0.5, 'phi_mode': 'sqrt', 'risk_gate_power': 3.0}
         greedy_curve_groups = []
         curve_save_dir = risk_features_cache_dir / 'plots'
 
@@ -867,9 +883,6 @@ if __name__ == '__main__':
             risk_scores = risk_scoring_function(
                 combined_risk_features,
                 sample_indices=np.arange(len(combined_data), dtype=np.int64),
-            )
-            risk_scores = apply_risk_score_power_transform(
-                risk_scores, exponent=risk_score_power,
             )
 
             snorkel_result = build_or_load_snorkel_result_from_risk_features(

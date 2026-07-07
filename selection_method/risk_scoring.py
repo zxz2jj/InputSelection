@@ -885,8 +885,8 @@ def compute_trc_by_budget(risk_score, error_mask, budget_ratios):
 
 
 if __name__ == "__main__":
-    # data_name = 'fmnist'
-    data_name = 'cifar10'
+    data_name = 'fmnist'
+    # data_name = 'cifar10'
 
     if data_name == 'fmnist':
         model_path = '../models/lenet_fmnist/tf_model.h5'
