@@ -20,26 +20,37 @@ import tensorflow as tf
 tf.get_logger().setLevel('ERROR')
 logging.getLogger().setLevel(logging.WARNING)
 
-
 from training_models.load_data import load_cifar10, load_fmnist
-from pseudo_labelling import build_or_load_snorkel_result_from_risk_features
-from risk_scoring import (
-    build_or_load_class_prototypes_dict,
-    build_or_load_risk_features,
-    risk_scoring_function,
-)
-from selection_method import (
-    build_or_load_greedy_run,
-    compute_flat_hidden_vectors_at_layer,
-    compute_greedy_selection_curves,
-)
-
 
 RQ1_BUDGET_RATIOS = [0.01, 0.03, 0.05, 0.10]
 RQ1_SEEDS = [0, 1, 2, 3, 4]
 RQ1_POOL_TYPES = ['adversarial', 'transformation']
 RQ1_ERROR_RATIOS = [0.10, 0.20]
+RQ1_DATASETS = ['fmnist', 'cifar10']
 ERROR_SAMPLING_MODES = ('random', 'high_conf')
+
+DATASET_CONFIG = {
+    'fmnist': {
+        'loader': load_fmnist,
+        'model_path': _REPO_ROOT / 'models' / 'lenet_fmnist' / 'tf_model.h5',
+    },
+    'cifar10': {
+        'loader': load_cifar10,
+        'model_path': _REPO_ROOT / 'models' / 'vgg19_cifar10' / 'tf_model.h5',
+    },
+}
+
+
+def configure_tensorflow_gpu():
+    gpus = tf.config.list_physical_devices('GPU')
+    if not gpus:
+        return []
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as exc:
+        print(f'Warning: could not enable GPU memory growth: {exc}')
+    return gpus
 
 
 def _budget_key(budget_ratio):
@@ -55,87 +66,6 @@ def _trc_by_budget_dict(budget_ratios, curve):
 
 def _lookup_trc(trc_by_budget, budget_ratio):
     return trc_by_budget[_budget_key(budget_ratio)]
-
-DATASET_CONFIG = {
-    'fmnist': {
-        'loader': load_fmnist,
-        'model_path': _REPO_ROOT / 'models' / 'lenet_fmnist' / 'tf_model.h5',
-        'assist_model_path': _REPO_ROOT / 'models' / 'resnet18_fmnist' / 'tf_model.h5',
-        'distance_layer_index': -4,
-        'consistency_layer_indices': [-10, -8, -6, -4],
-    },
-    'cifar10': {
-        'loader': load_cifar10,
-        'model_path': _REPO_ROOT / 'models' / 'vgg19_cifar10' / 'tf_model.h5',
-        'assist_model_path': _REPO_ROOT / 'models' / 'resnet18_cifar10' / 'tf_model.h5',
-        'distance_layer_index': -5,
-        'consistency_layer_indices': [-19, -15, -11, -5],
-    },
-}
-
-
-def _as_label_vector(arr):
-    out = np.asarray(arr)
-    if out.ndim > 1:
-        out = np.argmax(out, axis=-1)
-    return out.reshape(-1).astype(np.int64, copy=False)
-
-
-def build_flat_pool_storage_and_attributes(
-    pool_data,
-    clean_labels,
-    is_error,
-    predictions,
-    risk_out,
-    topk_idx,
-    topk_prob,
-    hidden_vectors,
-):
-    """Build storage/attributes for a shuffled mixed pool (sampled_data format)."""
-    n = int(len(pool_data))
-    pred = np.asarray(predictions, dtype=np.int64).reshape(-1)
-    clean = np.asarray(clean_labels, dtype=np.int64).reshape(-1)
-    err_flag = np.asarray(is_error, dtype=bool).reshape(-1)
-    if not (pred.shape[0] == clean.shape[0] == err_flag.shape[0] == n):
-        raise ValueError('flat pool field length mismatch')
-
-    rs = np.asarray(risk_out['risk_score'], dtype=np.float64).reshape(-1)
-    si = np.asarray(risk_out['sample_index'], dtype=np.int64).reshape(-1)
-    if rs.shape[0] != n or si.shape[0] != n:
-        raise ValueError('risk_out length mismatch with pool')
-    if not np.array_equal(si, np.arange(n, dtype=np.int64)):
-        raise ValueError('risk_out sample_index must be 0..n-1 in order')
-
-    tk = np.asarray(topk_idx, dtype=np.int64).reshape(n, -1)
-    tp = np.asarray(topk_prob, dtype=np.float32).reshape(n, -1)
-    if tk.shape[1] < 2 or tp.shape[1] < 2:
-        raise ValueError('topk_idx/prob must have at least 2 columns')
-    hv = np.asarray(hidden_vectors, dtype=np.float32)
-    if hv.shape[0] != n:
-        raise ValueError('hidden_vectors row count mismatch')
-
-    storage_out = []
-    attributes_out = []
-    for i in range(n):
-        pseudo = (
-            (int(tk[i, 0]), float(tp[i, 0])),
-            (int(tk[i, 1]), float(tp[i, 1])),
-        )
-        storage_out.append({
-            'idx': i,
-            'data': pool_data[i],
-            'clean_label': int(clean[i]),
-            'is_wrongly_predicted': bool(err_flag[i]),
-            'prediction': int(pred[i]),
-        })
-        attributes_out.append({
-            'idx': i,
-            'risk_score': float(rs[i]),
-            'prediction': int(pred[i]),
-            'top2_soft_pseudo_labelling': pseudo,
-            'hidden_vector': hv[i],
-        })
-    return storage_out, attributes_out
 
 
 def load_sampled_pool(sampled_root, dataset_name, pool_type, error_ratio, seed, sampling_mode='random'):
@@ -162,7 +92,118 @@ def pool_cache_tag(dataset_name, pool_type, error_ratio, seed, sampling_mode='ra
     return f'rq1_{dataset_name}_{pool_type}_r{ratio_pct:02d}_s{int(seed)}_{sampling_mode}'
 
 
-def evaluate_sampled_pool(
+def build_pool_storage(pool):
+    n = int(len(pool['clean_labels']))
+    clean = np.asarray(pool['clean_labels'], dtype=np.int64).reshape(-1)
+    pred = np.asarray(pool['predictions'], dtype=np.int64).reshape(-1)
+    err_flag = np.asarray(pool['is_error'], dtype=bool).reshape(-1)
+    if not (clean.shape[0] == pred.shape[0] == err_flag.shape[0] == n):
+        raise ValueError('flat pool field length mismatch')
+
+    storage_out = []
+    for i in range(n):
+        storage_out.append({
+            'idx': i,
+            'clean_label': int(clean[i]),
+            'is_wrongly_predicted': bool(err_flag[i]),
+            'prediction': int(pred[i]),
+        })
+    return storage_out
+
+
+def _probs_from_model_output(raw_out):
+    raw_out = tf.cast(tf.convert_to_tensor(raw_out), tf.float32)
+    looks_like_probs = tf.reduce_all((raw_out >= 0.0) & (raw_out <= 1.0)) & tf.reduce_all(
+        tf.abs(tf.reduce_sum(raw_out, axis=-1) - 1.0) < 1e-3,
+    )
+    return tf.cond(looks_like_probs, lambda: raw_out, lambda: tf.nn.softmax(raw_out, axis=-1))
+
+
+def compute_deepgini_scores(data, model, batch_size=64):
+    """DeepGini = 1 - sum_i p_i^2 over softmax probabilities."""
+    scores = []
+    n = len(data)
+    for start in range(0, n, batch_size):
+        batch = tf.convert_to_tensor(data[start:start + batch_size])
+        raw = model(batch, training=False)
+        probs = _probs_from_model_output(raw)
+        gini = 1.0 - tf.reduce_sum(tf.square(probs), axis=-1)
+        scores.append(np.asarray(gini.numpy(), dtype=np.float32).reshape(-1))
+    out = np.concatenate(scores)
+    if out.shape[0] != n:
+        raise ValueError('deepgini score length mismatch with pool')
+    return out
+
+
+def build_or_load_deepgini_scores(
+    *,
+    cache_dir,
+    cache_name,
+    data,
+    model,
+    batch_size=64,
+    force_recompute=False,
+):
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / cache_name
+
+    if cache_path.is_file() and not force_recompute:
+        z = np.load(cache_path)
+        scores = np.asarray(z['deepgini_score'], dtype=np.float32).reshape(-1)
+        if scores.shape[0] != len(data):
+            raise ValueError(f'deepgini cache length mismatch: {cache_path}')
+        print(f'Loaded DeepGini scores from {cache_path}')
+        return scores
+
+    scores = compute_deepgini_scores(data, model, batch_size=batch_size)
+    np.savez_compressed(cache_path, deepgini_score=scores)
+    print(f'Saved DeepGini scores to {cache_path}')
+    return scores
+
+
+def deepgini_selection_order(deepgini_scores):
+    scores = np.asarray(deepgini_scores, dtype=np.float64).reshape(-1)
+    n = scores.shape[0]
+    order = np.lexsort((np.arange(n, dtype=np.int64), -scores))
+    return order.tolist()
+
+
+def _error_mask_from_storage(storage_rows):
+    n = len(storage_rows)
+    err = np.zeros(n, dtype=bool)
+    for row in storage_rows:
+        err[int(row['idx'])] = bool(row['is_wrongly_predicted'])
+    return err
+
+
+def compute_selection_curves(storage_rows, selection_order, budget_ratios):
+    """Same TRC definition as selection_method.compute_greedy_selection_curves."""
+    err = _error_mask_from_storage(storage_rows)
+    n_pool = len(storage_rows)
+    total_errors = int(np.sum(err))
+    chosen = [int(i) for i in selection_order]
+
+    out_trc = []
+    for r in budget_ratios:
+        rr = float(r)
+        if rr <= 0 or rr > 1:
+            raise ValueError(f'budget ratio must be in (0, 1], got {rr}')
+        k = int(np.ceil(rr * n_pool))
+        k = max(1, min(k, n_pool))
+        prefix = chosen[:k]
+        discovered = int(np.sum(err[prefix]))
+        denom = min(k, total_errors)
+        trc = (discovered / denom) if denom > 0 else np.nan
+        out_trc.append(trc)
+
+    return {
+        'total_errors': total_errors,
+        'trc': out_trc,
+    }
+
+
+def evaluate_deepgini_pool(
     pool,
     *,
     dataset_name,
@@ -170,82 +211,28 @@ def evaluate_sampled_pool(
     error_ratio,
     seed,
     sampling_mode,
-    cnn_model,
-    assist_model,
-    prototypes_by_layer,
-    dataset_cfg,
+    model,
     cache_dir,
-    greedy_cfg,
-    max_budget_ratio,
     budget_ratios,
-    force_recompute=False,
+    batch_size,
+    force_recompute,
 ):
-    pool_data = pool['data']
-    n_pool = len(pool_data)
+    storage = build_pool_storage(pool)
+    n_pool = len(storage)
     tag = pool_cache_tag(dataset_name, pool_type, error_ratio, seed, sampling_mode)
-
-    risk_features = build_or_load_risk_features(
+    deepgini_scores = build_or_load_deepgini_scores(
         cache_dir=cache_dir,
-        cache_name=f'risk_features_{tag}.npz',
-        data=pool_data,
-        model=cnn_model,
-        prototypes_by_layer_map=prototypes_by_layer,
-        distance_feature_layer_index=dataset_cfg['distance_layer_index'],
-        consistency_feature_layer_indices=dataset_cfg['consistency_layer_indices'],
-        batch_size=16,
+        cache_name=f'deepgini_{tag}.npz',
+        data=pool['data'],
+        model=model,
+        batch_size=batch_size,
         force_recompute=force_recompute,
     )
-    risk_scores = risk_scoring_function(
-        risk_features,
-        sample_indices=np.arange(n_pool, dtype=np.int64),
-    )
-
-    snorkel_result = build_or_load_snorkel_result_from_risk_features(
-        cache_dir=cache_dir,
-        cache_name=f'snorkel_result_{tag}.npz',
-        data=pool_data,
-        risk_feature_map=risk_features,
-        lf_assist_model=assist_model,
-        lf_layer_indices=dataset_cfg['consistency_layer_indices'],
-        cardinality=int(cnn_model.output_shape[-1]),
-        gap_threshold=0.05,
-        topk=2,
-        force_recompute=force_recompute,
-    )
-
-    hidden_flat = compute_flat_hidden_vectors_at_layer(
-        pool_data,
-        cnn_model,
-        dataset_cfg['distance_layer_index'],
-    )
-    sample_storage, sample_attributes = build_flat_pool_storage_and_attributes(
-        pool_data,
-        pool['clean_labels'],
-        pool['is_error'],
-        risk_features['pred_classes'],
-        risk_scores,
-        snorkel_result['topk_idx'],
-        snorkel_result['topk_prob'],
-        hidden_flat,
-    )
-
-    greedy_order, _greedy_run = build_or_load_greedy_run(
-        cache_dir=cache_dir,
-        cache_name=f'greedy_run_{tag}.npz',
-        attribute_records=sample_attributes,
-        selection_ratio=float(max_budget_ratio),
-        greedy_cfg=greedy_cfg,
-        force_recompute=force_recompute,
-    )
-
-    curve = compute_greedy_selection_curves(
-        sample_storage,
-        greedy_order,
-        None,
-        budget_ratios=budget_ratios,
-    )
+    order = deepgini_selection_order(deepgini_scores)
+    curve = compute_selection_curves(storage, order, budget_ratios=budget_ratios)
     ratio_to_trc = _trc_by_budget_dict(budget_ratios, curve)
     return {
+        'method': 'deepgini',
         'dataset': dataset_name,
         'pool_type': pool_type,
         'sampling_mode': sampling_mode,
@@ -269,6 +256,7 @@ def aggregate_results(run_rows):
             vals = [_lookup_trc(r['trc_by_budget'], budget) for r in rows]
             arr = np.asarray(vals, dtype=np.float64)
             summary_rows.append({
+                'method': 'deepgini',
                 'dataset': dataset,
                 'pool_type': pool_type,
                 'sampling_mode': sampling_mode,
@@ -287,7 +275,7 @@ def aggregate_results(run_rows):
 def format_results_table(summary_rows, seeds):
     seed_headers = [f'seed{s}' for s in seeds]
     headers = [
-        'dataset', 'pool_type', 'sampling_mode', 'error_ratio', 'budget',
+        'method', 'dataset', 'pool_type', 'sampling_mode', 'error_ratio', 'budget',
         *seed_headers, 'mean', 'std',
     ]
     lines = [
@@ -297,6 +285,7 @@ def format_results_table(summary_rows, seeds):
     for row in summary_rows:
         seed_vals = row['seed_trc']
         cells = [
+            row['method'],
             row['dataset'],
             row['pool_type'],
             row['sampling_mode'],
@@ -313,8 +302,10 @@ def format_results_table(summary_rows, seeds):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='RQ1 greedy TRC evaluation on sampled pools.')
-    parser.add_argument('--datasets', nargs='+', default=['fmnist', 'cifar10'], choices=sorted(DATASET_CONFIG))
+    parser = argparse.ArgumentParser(
+        description='RQ1 DeepGini baseline TRC evaluation on sampled pools.',
+    )
+    parser.add_argument('--datasets', nargs='+', default=RQ1_DATASETS, choices=sorted(RQ1_DATASETS))
     parser.add_argument('--pool-types', nargs='+', default=RQ1_POOL_TYPES, choices=RQ1_POOL_TYPES)
     parser.add_argument('--error-ratios', nargs='+', type=float, default=RQ1_ERROR_RATIOS)
     parser.add_argument('--seeds', nargs='+', type=int, default=[0])
@@ -326,23 +317,14 @@ def parse_args():
     )
     parser.add_argument('--sampled-root', default=str(_EXP_DIR / 'sampled_data'))
     parser.add_argument('--output-dir', default=str(_EXP_DIR / 'results' / 'rq1'))
-    parser.add_argument('--greedy-alpha', type=float, default=0.5)
-    parser.add_argument('--greedy-phi-mode', default='sqrt')
-    parser.add_argument('--greedy-risk-gate-power', type=float, default=3.0)
+    parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--force-recompute', action='store_true')
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-
-    greedy_cfg = {
-        'alpha': float(args.greedy_alpha),
-        'phi_mode': str(args.greedy_phi_mode),
-        'risk_gate_power': float(args.greedy_risk_gate_power),
-    }
-    max_budget = max(RQ1_BUDGET_RATIOS)
-
+    configure_tensorflow_gpu()
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -351,28 +333,11 @@ def main():
         cfg = DATASET_CONFIG[dataset_name]
         if not Path(cfg['model_path']).is_file():
             raise FileNotFoundError(f'missing model: {cfg["model_path"]}')
-        if not Path(cfg['assist_model_path']).is_file():
-            raise FileNotFoundError(f'missing assist model: {cfg["assist_model_path"]}')
 
         print(f'=== dataset: {dataset_name} ===')
-        cnn_model = tf.keras.models.load_model(cfg['model_path'], compile=False)
-        assist_model = tf.keras.models.load_model(cfg['assist_model_path'], compile=False)
-        x_train, y_train, _, _ = cfg['loader']()
-        y_train = _as_label_vector(y_train)
-
+        model = tf.keras.models.load_model(cfg['model_path'], compile=False)
         cache_dir = _EXP_DIR / 'cache_files' / dataset_name
         cache_dir.mkdir(parents=True, exist_ok=True)
-        all_prototype_layers = list(dict.fromkeys(
-            [cfg['distance_layer_index']] + cfg['consistency_layer_indices'],
-        ))
-        prototypes_by_layer = build_or_load_class_prototypes_dict(
-            cnn_model,
-            train_data=x_train,
-            train_labels=y_train,
-            layer_indices=all_prototype_layers,
-            dataset_name=dataset_name,
-            batch_size=64,
-        )
 
         for pool_type in args.pool_types:
             for error_ratio in args.error_ratios:
@@ -385,26 +350,24 @@ def main():
                         seed,
                         args.error_sampling_mode,
                     )
+                    n_pool = len(pool['clean_labels'])
+                    n_errors = int(np.sum(pool['is_error']))
                     print(
-                        f'Evaluating {dataset_name}/{pool_type}/'
+                        f'Evaluating deepgini {dataset_name}/{pool_type}/'
                         f'{args.error_sampling_mode}/ratio={error_ratio:.2f}/seed={seed} '
-                        f'(n={len(pool["data"])}, errors={int(np.sum(pool["is_error"]))})',
+                        f'(n={n_pool}, errors={n_errors})',
                     )
-                    row = evaluate_sampled_pool(
+                    row = evaluate_deepgini_pool(
                         pool,
                         dataset_name=dataset_name,
                         pool_type=pool_type,
                         error_ratio=error_ratio,
                         seed=seed,
                         sampling_mode=args.error_sampling_mode,
-                        cnn_model=cnn_model,
-                        assist_model=assist_model,
-                        prototypes_by_layer=prototypes_by_layer,
-                        dataset_cfg=cfg,
+                        model=model,
                         cache_dir=cache_dir,
-                        greedy_cfg=greedy_cfg,
-                        max_budget_ratio=max_budget,
                         budget_ratios=RQ1_BUDGET_RATIOS,
+                        batch_size=int(args.batch_size),
                         force_recompute=args.force_recompute,
                     )
                     run_rows.append(row)
@@ -416,13 +379,13 @@ def main():
 
     summary_rows = aggregate_results(run_rows)
     table_text = format_results_table(summary_rows, args.seeds)
-    print('\n=== RQ1 TRC summary (mean over seeds) ===')
+    print('\n=== RQ1 DeepGini baseline TRC summary (mean over seeds) ===')
     print(table_text)
 
     mode_tag = args.error_sampling_mode
-    runs_path = out_dir / f'rq1_trc_runs_{mode_tag}.json'
-    summary_path = out_dir / f'rq1_trc_summary_{mode_tag}.json'
-    table_path = out_dir / f'rq1_trc_summary_table_{mode_tag}.md'
+    runs_path = out_dir / f'rq1_deepgini_trc_runs_{mode_tag}.json'
+    summary_path = out_dir / f'rq1_deepgini_trc_summary_{mode_tag}.json'
+    table_path = out_dir / f'rq1_deepgini_trc_summary_table_{mode_tag}.md'
     runs_path.write_text(json.dumps(run_rows, indent=2, sort_keys=True), encoding='utf-8')
     summary_path.write_text(json.dumps(summary_rows, indent=2, sort_keys=True), encoding='utf-8')
     table_path.write_text(table_text + '\n', encoding='utf-8')

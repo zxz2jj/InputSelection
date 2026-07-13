@@ -20,7 +20,6 @@ import tensorflow as tf
 tf.get_logger().setLevel('ERROR')
 logging.getLogger().setLevel(logging.WARNING)
 
-
 from training_models.load_data import load_cifar10, load_fmnist
 from pseudo_labelling import build_or_load_snorkel_result_from_risk_features
 from risk_scoring import (
@@ -31,30 +30,15 @@ from risk_scoring import (
 from selection_method import (
     build_or_load_greedy_run,
     compute_flat_hidden_vectors_at_layer,
-    compute_greedy_selection_curves,
+    real_error_type_universe_from_storage,
+    real_error_types_covered_in_prefix,
 )
 
-
-RQ1_BUDGET_RATIOS = [0.01, 0.03, 0.05, 0.10]
-RQ1_SEEDS = [0, 1, 2, 3, 4]
-RQ1_POOL_TYPES = ['adversarial', 'transformation']
-RQ1_ERROR_RATIOS = [0.10, 0.20]
+RQ2_BUDGET_RATIOS = [0.01, 0.03, 0.05, 0.10]
+RQ2_SEEDS = [0, 1, 2, 3, 4]
+RQ2_POOL_TYPES = ['adversarial', 'transformation']
+RQ2_ERROR_RATIOS = [0.10, 0.20]
 ERROR_SAMPLING_MODES = ('random', 'high_conf')
-
-
-def _budget_key(budget_ratio):
-    return round(float(budget_ratio), 4)
-
-
-def _trc_by_budget_dict(budget_ratios, curve):
-    trc = np.asarray(curve['trc'], dtype=np.float64).reshape(-1)
-    if len(trc) != len(budget_ratios):
-        raise ValueError('curve TRC length mismatch with requested budget ratios')
-    return {_budget_key(b): float(trc[i]) for i, b in enumerate(budget_ratios)}
-
-
-def _lookup_trc(trc_by_budget, budget_ratio):
-    return trc_by_budget[_budget_key(budget_ratio)]
 
 DATASET_CONFIG = {
     'fmnist': {
@@ -73,12 +57,53 @@ DATASET_CONFIG = {
     },
 }
 
+_GD_EPS = 1e-10
+
+
+def _budget_key(budget_ratio):
+    return round(float(budget_ratio), 4)
+
+
+def _metric_by_budget_dict(budget_ratios, values):
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if len(arr) != len(budget_ratios):
+        raise ValueError('metric length mismatch with requested budget ratios')
+    return {_budget_key(b): float(arr[i]) for i, b in enumerate(budget_ratios)}
+
+
+def _lookup_metric(metric_by_budget, budget_ratio):
+    return metric_by_budget[_budget_key(budget_ratio)]
+
 
 def _as_label_vector(arr):
     out = np.asarray(arr)
     if out.ndim > 1:
         out = np.argmax(out, axis=-1)
     return out.reshape(-1).astype(np.int64, copy=False)
+
+
+def load_sampled_pool(sampled_root, dataset_name, pool_type, error_ratio, seed, sampling_mode='random'):
+    ratio_name = f'error_ratio_{int(round(float(error_ratio) * 100)):02d}'
+    stem = f'seed_{int(seed)}_{sampling_mode}'
+    npz_path = Path(sampled_root) / dataset_name / pool_type / ratio_name / f'{stem}.npz'
+    json_path = npz_path.with_suffix('.json')
+    if not npz_path.is_file():
+        raise FileNotFoundError(f'missing sampled pool: {npz_path}')
+    z = np.load(npz_path)
+    metadata = json.loads(json_path.read_text(encoding='utf-8')) if json_path.is_file() else {}
+    return {
+        'data': np.asarray(z['data']),
+        'clean_labels': np.asarray(z['clean_labels'], dtype=np.int64).reshape(-1),
+        'is_error': np.asarray(z['is_error'], dtype=bool).reshape(-1),
+        'predictions': np.asarray(z['predictions'], dtype=np.int64).reshape(-1),
+        'metadata': metadata,
+        'path': npz_path,
+    }
+
+
+def pool_cache_tag(dataset_name, pool_type, error_ratio, seed, sampling_mode='random'):
+    ratio_pct = int(round(float(error_ratio) * 100))
+    return f'rq1_{dataset_name}_{pool_type}_r{ratio_pct:02d}_s{int(seed)}_{sampling_mode}'
 
 
 def build_flat_pool_storage_and_attributes(
@@ -91,7 +116,6 @@ def build_flat_pool_storage_and_attributes(
     topk_prob,
     hidden_vectors,
 ):
-    """Build storage/attributes for a shuffled mixed pool (sampled_data format)."""
     n = int(len(pool_data))
     pred = np.asarray(predictions, dtype=np.int64).reshape(-1)
     clean = np.asarray(clean_labels, dtype=np.int64).reshape(-1)
@@ -123,7 +147,6 @@ def build_flat_pool_storage_and_attributes(
         )
         storage_out.append({
             'idx': i,
-            'data': pool_data[i],
             'clean_label': int(clean[i]),
             'is_wrongly_predicted': bool(err_flag[i]),
             'prediction': int(pred[i]),
@@ -138,28 +161,115 @@ def build_flat_pool_storage_and_attributes(
     return storage_out, attributes_out
 
 
-def load_sampled_pool(sampled_root, dataset_name, pool_type, error_ratio, seed, sampling_mode='random'):
-    ratio_name = f'error_ratio_{int(round(float(error_ratio) * 100)):02d}'
-    stem = f'seed_{int(seed)}_{sampling_mode}'
-    npz_path = Path(sampled_root) / dataset_name / pool_type / ratio_name / f'{stem}.npz'
-    json_path = npz_path.with_suffix('.json')
-    if not npz_path.is_file():
-        raise FileNotFoundError(f'missing sampled pool: {npz_path}')
-    z = np.load(npz_path)
-    metadata = json.loads(json_path.read_text(encoding='utf-8')) if json_path.is_file() else {}
+def _group_true_error_ids_in_prefix(chosen_prefix, storage_rows):
+    rows_by_id = {int(row['idx']): row for row in storage_rows}
+    groups = {}
+    for sid in chosen_prefix:
+        row = rows_by_id.get(int(sid))
+        if row is None or not row['is_wrongly_predicted']:
+            continue
+        fault_type = (int(row['clean_label']), int(row['prediction']))
+        groups.setdefault(fault_type, []).append(int(sid))
+    return groups
+
+
+def build_hidden_by_idx(attribute_records, hidden_key='hidden_vector'):
+    hidden_by_sample = {}
+    for rec in attribute_records:
+        sid = int(rec['idx'])
+        vec = np.asarray(rec[hidden_key], dtype=np.float64).reshape(-1)
+        hidden_by_sample[sid] = vec
+    return hidden_by_sample
+
+
+def minmax_normalize_feature_matrix(feature_rows, eps=1e-12):
+    """Per-column min-max normalization (Wei et al., TSE 2023)."""
+    v = np.asarray(feature_rows, dtype=np.float64)
+    if v.ndim != 2:
+        raise ValueError('feature_rows must be 2D')
+    vmin = np.min(v, axis=0)
+    vmax = np.max(v, axis=0)
+    span = vmax - vmin
+    constant = span <= float(eps)
+    span = np.where(constant, 1.0, span)
+    out = (v - vmin) / span
+    out[:, constant] = 0.0
+    return out
+
+
+def geometric_diversity_score(feature_rows, eps=_GD_EPS):
+    """GD(S) = det(V V^T) on min-max normalized feature rows (Wei et al., TSE 2023)."""
+    v = minmax_normalize_feature_matrix(feature_rows)
+    n = v.shape[0]
+    if n < 2:
+        return np.nan
+
+    gram = v @ v.T
+    gram = gram + np.eye(n, dtype=np.float64) * float(eps)
+    sign, logdet = np.linalg.slogdet(gram)
+    if sign <= 0:
+        return 0.0
+    return float(np.exp(logdet))
+
+
+def intra_type_gd_stats_for_prefix(chosen_prefix, storage_rows, hidden_by_idx):
+    groups = _group_true_error_ids_in_prefix(chosen_prefix, storage_rows)
+    gd_values = []
+    for sids in groups.values():
+        if len(sids) < 2:
+            continue
+        matrix = np.stack([hidden_by_idx[int(sid)] for sid in sids], axis=0)
+        gd = geometric_diversity_score(matrix)
+        if np.isfinite(gd):
+            gd_values.append(gd)
+    if not gd_values:
+        return np.nan, 0
+    return float(np.sum(gd_values)), int(len(gd_values))
+
+
+def compute_diversity_curves(
+    storage_rows,
+    selection_order,
+    hidden_by_idx,
+    budget_ratios=None,
+):
+    if budget_ratios is None:
+        budget_ratios = RQ2_BUDGET_RATIOS
+
+    n_pool = len(storage_rows)
+    real_universe = real_error_type_universe_from_storage(storage_rows)
+    total_fault_types = len(real_universe)
+    chosen = [int(i) for i in selection_order]
+
+    out_fault_type_count = []
+    out_sum_intra_type_gd = []
+    out_intra_type_gd_type_count = []
+
+    for r in budget_ratios:
+        rr = float(r)
+        if rr <= 0 or rr > 1:
+            raise ValueError(f'budget ratio must be in (0, 1], got {rr}')
+        k = int(np.ceil(rr * n_pool))
+        k = max(1, min(k, n_pool))
+        prefix = chosen[:k]
+
+        discovered_types = real_error_types_covered_in_prefix(prefix, storage_rows, real_universe)
+        ft_count = len(discovered_types)
+        sum_gd, gd_type_count = intra_type_gd_stats_for_prefix(
+            prefix, storage_rows, hidden_by_idx,
+        )
+
+        out_fault_type_count.append(ft_count)
+        out_sum_intra_type_gd.append(sum_gd)
+        out_intra_type_gd_type_count.append(gd_type_count)
+
     return {
-        'data': np.asarray(z['data']),
-        'clean_labels': np.asarray(z['clean_labels'], dtype=np.int64).reshape(-1),
-        'is_error': np.asarray(z['is_error'], dtype=bool).reshape(-1),
-        'predictions': np.asarray(z['predictions'], dtype=np.int64).reshape(-1),
-        'metadata': metadata,
-        'path': npz_path,
+        'total_fault_types': int(total_fault_types),
+        'fault_type_count': np.asarray(out_fault_type_count, dtype=np.int32),
+        'sum_intra_type_gd': np.asarray(out_sum_intra_type_gd, dtype=np.float64),
+        'intra_type_gd_type_count': np.asarray(out_intra_type_gd_type_count, dtype=np.int32),
+        'chosen_ids': np.asarray(chosen, dtype=np.int64),
     }
-
-
-def pool_cache_tag(dataset_name, pool_type, error_ratio, seed, sampling_mode='random'):
-    ratio_pct = int(round(float(error_ratio) * 100))
-    return f'rq1_{dataset_name}_{pool_type}_r{ratio_pct:02d}_s{int(seed)}_{sampling_mode}'
 
 
 def evaluate_sampled_pool(
@@ -228,6 +338,7 @@ def evaluate_sampled_pool(
         snorkel_result['topk_prob'],
         hidden_flat,
     )
+    hidden_by_idx = build_hidden_by_idx(sample_attributes)
 
     greedy_order, _greedy_run = build_or_load_greedy_run(
         cache_dir=cache_dir,
@@ -238,85 +349,107 @@ def evaluate_sampled_pool(
         force_recompute=force_recompute,
     )
 
-    curve = compute_greedy_selection_curves(
+    curve = compute_diversity_curves(
         sample_storage,
         greedy_order,
-        None,
+        hidden_by_idx,
         budget_ratios=budget_ratios,
     )
-    ratio_to_trc = _trc_by_budget_dict(budget_ratios, curve)
     return {
+        'method': 'greedy',
         'dataset': dataset_name,
         'pool_type': pool_type,
         'sampling_mode': sampling_mode,
         'error_ratio': float(error_ratio),
         'seed': int(seed),
         'num_total': int(n_pool),
-        'total_errors': int(curve['total_errors']),
-        'trc_by_budget': ratio_to_trc,
+        'total_fault_types': int(curve['total_fault_types']),
+        'fault_type_count_by_budget': _metric_by_budget_dict(
+            budget_ratios, curve['fault_type_count'],
+        ),
+        'sum_intra_type_gd_by_budget': _metric_by_budget_dict(
+            budget_ratios, curve['sum_intra_type_gd'],
+        ),
+        'intra_type_gd_type_count_by_budget': _metric_by_budget_dict(
+            budget_ratios, curve['intra_type_gd_type_count'],
+        ),
     }
 
 
-def aggregate_results(run_rows):
+def aggregate_results(run_rows, metric_key, budget_ratios):
     groups = {}
     for row in run_rows:
-        key = (row['dataset'], row['pool_type'], row['sampling_mode'], row['error_ratio'])
+        key = (row['method'], row['dataset'], row['pool_type'], row['sampling_mode'], row['error_ratio'])
         groups.setdefault(key, []).append(row)
 
     summary_rows = []
-    for (dataset, pool_type, sampling_mode, error_ratio), rows in sorted(groups.items()):
-        for budget in RQ1_BUDGET_RATIOS:
-            vals = [_lookup_trc(r['trc_by_budget'], budget) for r in rows]
+    for (method, dataset, pool_type, sampling_mode, error_ratio), rows in sorted(groups.items()):
+        for budget in budget_ratios:
+            vals = [_lookup_metric(r[metric_key], budget) for r in rows]
             arr = np.asarray(vals, dtype=np.float64)
             summary_rows.append({
+                'method': method,
                 'dataset': dataset,
                 'pool_type': pool_type,
                 'sampling_mode': sampling_mode,
                 'error_ratio': error_ratio,
                 'budget': float(budget),
-                'seed_trc': {
-                    int(r['seed']): _lookup_trc(r['trc_by_budget'], budget) for r in rows
+                'seed_values': {
+                    int(r['seed']): _lookup_metric(r[metric_key], budget) for r in rows
                 },
-                'mean_trc': float(np.nanmean(arr)),
-                'std_trc': float(np.nanstd(arr, ddof=0)),
+                'mean': float(np.nanmean(arr)),
+                'std': float(np.nanstd(arr, ddof=0)),
                 'n_seeds': len(rows),
             })
     return summary_rows
 
 
-def format_results_table(summary_rows, seeds):
-    seed_headers = [f'seed{s}' for s in seeds]
+def format_results_table(summary_rows, metric_name, budget_ratios, seeds):
     headers = [
-        'dataset', 'pool_type', 'sampling_mode', 'error_ratio', 'budget',
-        *seed_headers, 'mean', 'std',
-    ]
+        'method', 'dataset', 'pool_type', 'sampling_mode', 'error_ratio', 'budget', metric_name,
+    ] + [f'seed{s}' for s in seeds] + ['mean', 'std']
     lines = [
         ' | '.join(headers),
         ' | '.join(['---'] * len(headers)),
     ]
     for row in summary_rows:
-        seed_vals = row['seed_trc']
+        seed_vals = row['seed_values']
         cells = [
+            row['method'],
             row['dataset'],
             row['pool_type'],
             row['sampling_mode'],
             f'{row["error_ratio"]:.2f}',
             f'{row["budget"]:.0%}',
+            metric_name,
         ]
         for seed in seeds:
             val = seed_vals.get(seed, np.nan)
-            cells.append('nan' if not np.isfinite(val) else f'{val:.4f}')
-        cells.append(f'{row["mean_trc"]:.4f}')
-        cells.append(f'{row["std_trc"]:.4f}')
+            if metric_name == 'fault_type_count':
+                cells.append('nan' if not np.isfinite(val) else f'{int(round(val))}')
+            else:
+                cells.append('nan' if not np.isfinite(val) else f'{val:.6f}')
+        cells.append(
+            'nan' if not np.isfinite(row['mean']) else (
+                f'{int(round(row["mean"]))}' if metric_name == 'fault_type_count' else f'{row["mean"]:.6f}'
+            ),
+        )
+        cells.append(
+            'nan' if not np.isfinite(row['std']) else (
+                f'{row["std"]:.4f}' if metric_name == 'fault_type_count' else f'{row["std"]:.6f}'
+            ),
+        )
         lines.append(' | '.join(cells))
     return '\n'.join(lines)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='RQ1 greedy TRC evaluation on sampled pools.')
+    parser = argparse.ArgumentParser(
+        description='RQ2 diversity evaluation (fault type count + sum intra-type GD) on sampled pools.',
+    )
     parser.add_argument('--datasets', nargs='+', default=['fmnist', 'cifar10'], choices=sorted(DATASET_CONFIG))
-    parser.add_argument('--pool-types', nargs='+', default=RQ1_POOL_TYPES, choices=RQ1_POOL_TYPES)
-    parser.add_argument('--error-ratios', nargs='+', type=float, default=RQ1_ERROR_RATIOS)
+    parser.add_argument('--pool-types', nargs='+', default=RQ2_POOL_TYPES, choices=RQ2_POOL_TYPES)
+    parser.add_argument('--error-ratios', nargs='+', type=float, default=RQ2_ERROR_RATIOS)
     parser.add_argument('--seeds', nargs='+', type=int, default=[0])
     parser.add_argument(
         '--error-sampling-mode',
@@ -325,7 +458,7 @@ def parse_args():
         help='sampled pool filename suffix (seed_N_<mode>.npz)',
     )
     parser.add_argument('--sampled-root', default=str(_EXP_DIR / 'sampled_data'))
-    parser.add_argument('--output-dir', default=str(_EXP_DIR / 'results' / 'rq1'))
+    parser.add_argument('--output-dir', default=str(_EXP_DIR / 'results' / 'rq2'))
     parser.add_argument('--greedy-alpha', type=float, default=0.5)
     parser.add_argument('--greedy-phi-mode', default='sqrt')
     parser.add_argument('--greedy-risk-gate-power', type=float, default=3.0)
@@ -341,7 +474,7 @@ def main():
         'phi_mode': str(args.greedy_phi_mode),
         'risk_gate_power': float(args.greedy_risk_gate_power),
     }
-    max_budget = max(RQ1_BUDGET_RATIOS)
+    max_budget = max(RQ2_BUDGET_RATIOS)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -386,7 +519,7 @@ def main():
                         args.error_sampling_mode,
                     )
                     print(
-                        f'Evaluating {dataset_name}/{pool_type}/'
+                        f'Evaluating diversity {dataset_name}/{pool_type}/'
                         f'{args.error_sampling_mode}/ratio={error_ratio:.2f}/seed={seed} '
                         f'(n={len(pool["data"])}, errors={int(np.sum(pool["is_error"]))})',
                     )
@@ -404,31 +537,51 @@ def main():
                         cache_dir=cache_dir,
                         greedy_cfg=greedy_cfg,
                         max_budget_ratio=max_budget,
-                        budget_ratios=RQ1_BUDGET_RATIOS,
+                        budget_ratios=RQ2_BUDGET_RATIOS,
                         force_recompute=args.force_recompute,
                     )
                     run_rows.append(row)
-                    trc_str = ', '.join(
-                        f'{b:.0%}={_lookup_trc(row["trc_by_budget"], b):.4f}'
-                        for b in RQ1_BUDGET_RATIOS
+                    ft_str = ', '.join(
+                        f'{b:.0%}={int(_lookup_metric(row["fault_type_count_by_budget"], b))}'
+                        for b in RQ2_BUDGET_RATIOS
                     )
-                    print(f'  TRC: {trc_str}')
+                    gd_sum_str = ', '.join(
+                        f'{b:.0%}={_lookup_metric(row["sum_intra_type_gd_by_budget"], b):.6f}'
+                        for b in RQ2_BUDGET_RATIOS
+                    )
+                    print(f'  fault_type_count: {ft_str}')
+                    print(f'  sum_intra_type_gd: {gd_sum_str}')
 
-    summary_rows = aggregate_results(run_rows)
-    table_text = format_results_table(summary_rows, args.seeds)
-    print('\n=== RQ1 TRC summary (mean over seeds) ===')
-    print(table_text)
+    ft_summary = aggregate_results(run_rows, 'fault_type_count_by_budget', RQ2_BUDGET_RATIOS)
+    gd_sum_summary = aggregate_results(run_rows, 'sum_intra_type_gd_by_budget', RQ2_BUDGET_RATIOS)
+    ft_table = format_results_table(ft_summary, 'fault_type_count', RQ2_BUDGET_RATIOS, args.seeds)
+    gd_sum_table = format_results_table(
+        gd_sum_summary, 'sum_intra_type_gd', RQ2_BUDGET_RATIOS, args.seeds,
+    )
+
+    print('\n=== RQ2 fault_type_count summary (mean over seeds) ===')
+    print(ft_table)
+    print('\n=== RQ2 sum_intra_type_gd summary (mean over seeds) ===')
+    print(gd_sum_table)
 
     mode_tag = args.error_sampling_mode
-    runs_path = out_dir / f'rq1_trc_runs_{mode_tag}.json'
-    summary_path = out_dir / f'rq1_trc_summary_{mode_tag}.json'
-    table_path = out_dir / f'rq1_trc_summary_table_{mode_tag}.md'
+    runs_path = out_dir / f'rq2_diversity_runs_{mode_tag}.json'
+    ft_summary_path = out_dir / f'rq2_fault_type_count_summary_{mode_tag}.json'
+    gd_sum_summary_path = out_dir / f'rq2_sum_intra_type_gd_summary_{mode_tag}.json'
+    ft_table_path = out_dir / f'rq2_fault_type_count_summary_table_{mode_tag}.md'
+    gd_sum_table_path = out_dir / f'rq2_sum_intra_type_gd_summary_table_{mode_tag}.md'
+
     runs_path.write_text(json.dumps(run_rows, indent=2, sort_keys=True), encoding='utf-8')
-    summary_path.write_text(json.dumps(summary_rows, indent=2, sort_keys=True), encoding='utf-8')
-    table_path.write_text(table_text + '\n', encoding='utf-8')
+    ft_summary_path.write_text(json.dumps(ft_summary, indent=2, sort_keys=True), encoding='utf-8')
+    gd_sum_summary_path.write_text(json.dumps(gd_sum_summary, indent=2, sort_keys=True), encoding='utf-8')
+    ft_table_path.write_text(ft_table + '\n', encoding='utf-8')
+    gd_sum_table_path.write_text(gd_sum_table + '\n', encoding='utf-8')
+
     print(f'\nSaved runs: {runs_path}')
-    print(f'Saved summary: {summary_path}')
-    print(f'Saved table: {table_path}')
+    print(f'Saved fault_type_count summary: {ft_summary_path}')
+    print(f'Saved sum_intra_type_gd summary: {gd_sum_summary_path}')
+    print(f'Saved fault_type_count table: {ft_table_path}')
+    print(f'Saved sum_intra_type_gd table: {gd_sum_table_path}')
 
 
 if __name__ == '__main__':

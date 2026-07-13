@@ -54,6 +54,8 @@ POOL_PREFIXES = {
     'transformation': TRANSFORMATION_PREFIXES,
 }
 
+ERROR_SAMPLING_MODES = ('random', 'high_conf')
+
 
 @dataclass
 class CorrectPool:
@@ -180,61 +182,99 @@ def load_error_source(
     )
 
 
-def confidence_stratified_sample_indices(confidence_bin, target_count, n_bins, rng):
-    bins = np.asarray(confidence_bin, dtype=np.int64).reshape(-1)
+def random_sample_indices(n_population, target_count, rng):
+    n_population = int(n_population)
     target_count = int(target_count)
     if target_count < 0:
         raise ValueError('target_count must be non-negative')
-    if target_count > len(bins):
-        raise ValueError(f'target_count={target_count} exceeds population={len(bins)}')
+    if target_count > n_population:
+        raise ValueError(f'target_count={target_count} exceeds population={n_population}')
     if target_count == 0:
         return np.empty(0, dtype=np.int64)
+    return rng.choice(n_population, size=target_count, replace=False).astype(np.int64, copy=False)
 
-    per_bin_indices = []
-    for b in range(int(n_bins)):
-        idx = np.where(bins == b)[0].astype(np.int64, copy=False)
-        rng.shuffle(idx)
-        per_bin_indices.append(idx)
 
-    bin_order = np.arange(int(n_bins), dtype=np.int64)
-    rng.shuffle(bin_order)
-
-    base = target_count // int(n_bins)
-    remainder = target_count % int(n_bins)
-    desired = np.full(int(n_bins), base, dtype=np.int64)
-    desired[bin_order[:remainder]] += 1
-
-    take_counts = np.array(
-        [min(int(desired[b]), len(per_bin_indices[b])) for b in range(int(n_bins))],
-        dtype=np.int64,
+def _high_conf_indices(confidence, threshold):
+    return np.where(np.asarray(confidence, dtype=np.float64) > float(threshold))[0].astype(
+        np.int64,
+        copy=False,
     )
-    remaining = target_count - int(np.sum(take_counts))
 
-    while remaining > 0:
-        progressed = False
-        rng.shuffle(bin_order)
-        for b in bin_order:
-            capacity = len(per_bin_indices[int(b)]) - int(take_counts[int(b)])
-            if capacity <= 0:
-                continue
-            take_counts[int(b)] += 1
-            remaining -= 1
-            progressed = True
-            if remaining == 0:
-                break
-        if not progressed:
+
+def sample_error_indices_per_source(
+    error_sources,
+    per_source_error_count,
+    sampling_mode,
+    high_conf_threshold,
+    rng,
+):
+    if sampling_mode not in ERROR_SAMPLING_MODES:
+        raise ValueError(f'unsupported sampling_mode={sampling_mode!r}')
+
+    per_target = int(per_source_error_count)
+    n_sources = len(error_sources)
+    total_target = per_target * n_sources
+    chosen_by_source = {}
+    per_actual = {}
+
+    if sampling_mode == 'random':
+        for src in error_sources:
+            idx = random_sample_indices(len(src.data), per_target, rng)
+            chosen_by_source[src.prefix] = idx
+            per_actual[src.prefix] = int(len(idx))
+        sampling_info = {
+            'per_source_error_target': per_target,
+            'per_source_error_actual': per_actual,
+            'total_error_target': total_target,
+            'error_deficit': 0,
+            'cross_source_rebalance': False,
+        }
+        return chosen_by_source, sampling_info
+
+    threshold = float(high_conf_threshold)
+    remaining_pools = {}
+    for src in error_sources:
+        pool = _high_conf_indices(src.confidence, threshold)
+        n_take = min(len(pool), per_target)
+        if n_take > 0:
+            pick_positions = rng.choice(len(pool), size=n_take, replace=False).astype(np.int64, copy=False)
+            chosen = pool[pick_positions]
+            chosen_by_source[src.prefix] = chosen.astype(np.int64, copy=False)
+            remaining_pools[src.prefix] = np.delete(pool, pick_positions)
+        else:
+            chosen_by_source[src.prefix] = np.empty(0, dtype=np.int64)
+            remaining_pools[src.prefix] = pool
+        per_actual[src.prefix] = int(len(chosen_by_source[src.prefix]))
+
+    deficit = total_target - int(sum(per_actual.values()))
+    cross_source_rebalance = deficit > 0
+    while deficit > 0:
+        eligible = [prefix for prefix, pool in remaining_pools.items() if len(pool) > 0]
+        if not eligible:
             break
+        rng.shuffle(eligible)
+        for prefix in eligible:
+            if deficit <= 0:
+                break
+            pool = remaining_pools[prefix]
+            pick_pos = int(rng.integers(0, len(pool)))
+            pick_idx = int(pool[pick_pos])
+            chosen_by_source[prefix] = np.append(chosen_by_source[prefix], pick_idx).astype(
+                np.int64,
+                copy=False,
+            )
+            remaining_pools[prefix] = np.delete(pool, pick_pos)
+            per_actual[prefix] += 1
+            deficit -= 1
 
-    chosen = [
-        per_bin_indices[b][: int(take_counts[b])]
-        for b in range(int(n_bins))
-        if take_counts[b] > 0
-    ]
-    out = np.concatenate(chosen).astype(np.int64, copy=False)
-    rng.shuffle(out)
-    if len(out) != target_count:
-        raise RuntimeError(f'failed to sample requested count: got {len(out)}, expected {target_count}')
-    return out
+    sampling_info = {
+        'per_source_error_target': per_target,
+        'per_source_error_actual': per_actual,
+        'total_error_target': total_target,
+        'error_deficit': int(deficit),
+        'cross_source_rebalance': cross_source_rebalance,
+    }
+    return chosen_by_source, sampling_info
 
 
 def compute_per_source_error_count(correct_count_available, error_ratio, source_counts, max_errors_per_source):
@@ -267,9 +307,19 @@ def build_sampled_pool(
     error_ratio,
     confidence_bins,
     per_source_error_count,
+    sampling_mode,
+    high_conf_threshold,
     seed,
 ):
     rng = np.random.default_rng(int(seed))
+    chosen_by_source, sampling_info = sample_error_indices_per_source(
+        error_sources,
+        per_source_error_count,
+        sampling_mode,
+        high_conf_threshold,
+        rng,
+    )
+
     source_error_chunks = []
     source_label_chunks = []
     source_pred_chunks = []
@@ -281,12 +331,7 @@ def build_sampled_pool(
     is_error_chunks = []
 
     for src in error_sources:
-        idx = confidence_stratified_sample_indices(
-            src.confidence_bin,
-            per_source_error_count,
-            confidence_bins,
-            rng,
-        )
+        idx = chosen_by_source[src.prefix]
         n = len(idx)
         source_error_chunks.append(src.data[idx])
         source_label_chunks.append(src.labels[idx])
@@ -340,19 +385,34 @@ def build_sampled_pool(
     order = np.arange(len(data), dtype=np.int64)
     rng.shuffle(order)
 
+    if sampling_mode == 'random':
+        sampling_desc = 'per-source uniform random errors + random correct samples'
+    else:
+        sampling_desc = (
+            'per-source uniform random from high-confidence errors with cross-source rebalance; '
+            'correct sample count follows error_ratio from actual high-confidence errors'
+        )
+
     metadata = {
         'dataset': dataset_name,
         'pool_type': pool_type,
+        'sampling_mode': sampling_mode,
         'error_ratio': float(error_ratio),
         'seed': int(seed),
         'confidence_bins': int(confidence_bins),
+        'high_conf_threshold': float(high_conf_threshold) if sampling_mode == 'high_conf' else None,
         'per_source_error_count': int(per_source_error_count),
+        'per_source_error_target': int(sampling_info['per_source_error_target']),
+        'per_source_error_actual': sampling_info['per_source_error_actual'],
+        'total_error_target': int(sampling_info.get('total_error_target', n_errors)),
+        'error_deficit': int(sampling_info.get('error_deficit', 0)),
+        'cross_source_rebalance': bool(sampling_info['cross_source_rebalance']),
         'num_sources': len(error_sources),
         'num_errors': int(n_errors),
         'num_correct': int(n_correct),
         'num_total': int(len(data)),
         'source_prefixes': [src.prefix for src in error_sources],
-        'sampling': 'source-balanced and confidence-stratified generated errors',
+        'sampling': sampling_desc,
     }
 
     return {
@@ -369,12 +429,23 @@ def build_sampled_pool(
     }, metadata
 
 
-def save_pool(out_root, dataset_name, pool_type, error_ratio, seed, arrays, metadata, overwrite):
+def save_pool(
+    out_root,
+    dataset_name,
+    pool_type,
+    error_ratio,
+    seed,
+    sampling_mode,
+    arrays,
+    metadata,
+    overwrite,
+):
     ratio_name = f'error_ratio_{int(round(float(error_ratio) * 100)):02d}'
     out_dir = Path(out_root) / dataset_name / pool_type / ratio_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_npz = out_dir / f'seed_{int(seed)}.npz'
-    out_json = out_dir / f'seed_{int(seed)}.json'
+    stem = f'seed_{int(seed)}_{sampling_mode}'
+    out_npz = out_dir / f'{stem}.npz'
+    out_json = out_dir / f'{stem}.json'
     if out_npz.exists() and not overwrite:
         print(f'Skip existing {out_npz}')
         return
@@ -389,7 +460,7 @@ def save_pool(out_root, dataset_name, pool_type, error_ratio, seed, arrays, meta
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Build source- and confidence-balanced mixed pools for input selection experiments.',
+        description='Build mixed pools with random or high-confidence error sampling.',
     )
     parser.add_argument('--datasets', nargs='+', default=['fmnist', 'cifar10'], choices=sorted(DATASET_CONFIG))
     parser.add_argument(
@@ -398,9 +469,16 @@ def parse_args():
         default=['adversarial', 'transformation'],
         choices=sorted(POOL_PREFIXES),
     )
+    parser.add_argument(
+        '--error-sampling-modes',
+        nargs='+',
+        default=['random', 'high_conf'],
+        choices=list(ERROR_SAMPLING_MODES),
+    )
     parser.add_argument('--error-ratios', nargs='+', type=float, default=[0.10, 0.20])
-    parser.add_argument('--seeds', nargs='+', type=int, default=[0, 1, 2, 3, 4])
+    parser.add_argument('--seeds', nargs='+', type=int, default=[0])
     parser.add_argument('--confidence-bins', type=int, default=10)
+    parser.add_argument('--high-conf-threshold', type=float, default=0.9)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--max-errors-per-source', type=int, default=None)
     parser.add_argument('--output-root', default=str(_EXP_DIR / 'sampled_data'))
@@ -414,6 +492,8 @@ def main():
     args = parse_args()
     if int(args.confidence_bins) <= 0:
         raise ValueError('--confidence-bins must be positive')
+    if not (0.0 < float(args.high_conf_threshold) < 1.0):
+        raise ValueError('--high-conf-threshold must be in (0, 1)')
 
     all_manifest = []
     for dataset_name in args.datasets:
@@ -442,47 +522,76 @@ def main():
                 for prefix in prefixes
             ]
             source_counts = [len(src.data) for src in error_sources]
-            print(f'{dataset_name}/{pool_type}: available erroneous samples by source = {dict(zip(prefixes, source_counts))}')
+            high_conf_counts = [
+                len(_high_conf_indices(src.confidence, args.high_conf_threshold))
+                for src in error_sources
+            ]
+            print(
+                f'{dataset_name}/{pool_type}: available erroneous samples by source = '
+                f'{dict(zip(prefixes, source_counts))}',
+            )
+            print(
+                f'{dataset_name}/{pool_type}: high-confidence errors by source '
+                f'(threshold={args.high_conf_threshold}) = '
+                f'{dict(zip(prefixes, high_conf_counts))}',
+            )
 
-            for error_ratio in args.error_ratios:
-                per_source_count = compute_per_source_error_count(
-                    len(correct_pool.data),
-                    error_ratio,
-                    source_counts,
-                    args.max_errors_per_source,
-                )
-                total_errors = per_source_count * len(error_sources)
-                total_correct = int(round(total_errors * (1.0 - float(error_ratio)) / float(error_ratio)))
-                print(
-                    f'{dataset_name}/{pool_type}/ratio={error_ratio:.2f}: '
-                    f'per_source_errors={per_source_count}, total_errors={total_errors}, '
-                    f'total_correct={total_correct}',
-                )
-                if args.dry_run:
-                    continue
-
-                for seed in args.seeds:
-                    arrays, metadata = build_sampled_pool(
-                        correct_pool,
-                        error_sources,
-                        dataset_name=dataset_name,
-                        pool_type=pool_type,
-                        error_ratio=error_ratio,
-                        confidence_bins=args.confidence_bins,
-                        per_source_error_count=per_source_count,
-                        seed=seed,
-                    )
-                    save_pool(
-                        args.output_root,
-                        dataset_name,
-                        pool_type,
+            for sampling_mode in args.error_sampling_modes:
+                for error_ratio in args.error_ratios:
+                    per_source_count = compute_per_source_error_count(
+                        len(correct_pool.data),
                         error_ratio,
-                        seed,
-                        arrays,
-                        metadata,
-                        args.overwrite,
+                        source_counts,
+                        args.max_errors_per_source,
                     )
-                    all_manifest.append(metadata)
+                    total_errors = per_source_count * len(error_sources)
+                    total_correct = int(
+                        round(total_errors * (1.0 - float(error_ratio)) / float(error_ratio)),
+                    )
+                    extra = ''
+                    if sampling_mode == 'high_conf':
+                        total_hc_available = int(sum(high_conf_counts))
+                        expected_errors = min(total_errors, total_hc_available)
+                        expected_correct = int(
+                            round(expected_errors * (1.0 - float(error_ratio)) / float(error_ratio)),
+                        )
+                        extra = (
+                            f', high_conf_available={total_hc_available}, '
+                            f'expected_errors={expected_errors}, expected_correct={expected_correct}'
+                        )
+                    print(
+                        f'{dataset_name}/{pool_type}/{sampling_mode}/ratio={error_ratio:.2f}: '
+                        f'per_source_errors={per_source_count}, total_errors={total_errors}, '
+                        f'total_correct={total_correct}{extra}',
+                    )
+                    if args.dry_run:
+                        continue
+
+                    for seed in args.seeds:
+                        arrays, metadata = build_sampled_pool(
+                            correct_pool,
+                            error_sources,
+                            dataset_name=dataset_name,
+                            pool_type=pool_type,
+                            error_ratio=error_ratio,
+                            confidence_bins=args.confidence_bins,
+                            per_source_error_count=per_source_count,
+                            sampling_mode=sampling_mode,
+                            high_conf_threshold=args.high_conf_threshold,
+                            seed=seed,
+                        )
+                        save_pool(
+                            args.output_root,
+                            dataset_name,
+                            pool_type,
+                            error_ratio,
+                            seed,
+                            sampling_mode,
+                            arrays,
+                            metadata,
+                            args.overwrite,
+                        )
+                        all_manifest.append(metadata)
 
     if not args.dry_run:
         manifest_path = Path(args.output_root) / 'manifest.json'
