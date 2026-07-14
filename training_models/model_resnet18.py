@@ -121,7 +121,7 @@ class ResNet18Model(object):
 
     def show_model(self):
         model = tf.keras.models.load_model(self.model_save_path+self.model_name)
-        model.summary()
+        # model.summary()
         print("train dataset:")
         print(self.train_data.shape, self.train_label.shape)
         model.evaluate(self.train_data, self.train_label, verbose=2)

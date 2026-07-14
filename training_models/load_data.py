@@ -1,14 +1,19 @@
+from pathlib import Path
+
 import numpy as np
 # import os
 # import glob
 # import pandas as pd
 # # from skimage import io, transform
-# from scipy.io import loadmat
+from scipy.io import loadmat
 import tensorflow as tf
 from tensorflow.keras import datasets
 # import cv2
 
 from tensorflow.keras import preprocessing
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SVHN_DIR = _REPO_ROOT / 'data' / 'svhn'
 
 data_augmentation = preprocessing.image.ImageDataGenerator(
     # 布尔值，使输入数据集去中心化（均值为0）, 按feature执行
@@ -105,32 +110,32 @@ def load_cifar10():
 #     return x_train, y_train_one_hot, \
 #         x_test, y_test_one_hot
 #
-#
-# def load_mat_data(path):
-#     """ Helper function for loading a MAT-File"""
-#     data = loadmat(path)
-#     return data['X'], data['y']
-#
-#
-# def load_svhn():
-#     x_train, y_train = load_mat_data('./data/svhn/train_32x32.mat')
-#     x_test, y_test = load_mat_data('./data/svhn/test_32x32.mat')
-#     y_train = y_train.reshape(-1)
-#     y_test = y_test.reshape(-1)
-#     x_train = np.transpose(x_train, (3, 0, 1, 2))
-#     x_test = np.transpose(x_test, (3, 0, 1, 2))
-#     x_train = x_train.astype('float32') / 255.
-#     x_test = x_test.astype('float32') / 255.
-#     # io.imshow(x_test[3])
-#     # io.show()
-#     y_train[np.where(y_train == 10)] = 0
-#     y_test[np.where(y_test == 10)] = 0
-#     y_train_one_hot = tf.one_hot(y_train, 10)
-#     y_test_one_hot = tf.one_hot(y_test, 10)
-#     print("Training Set", x_train.shape, y_train.shape)
-#     print("Test Set", x_test.shape, y_test.shape)
-#
-#     return x_train, y_train_one_hot, x_test, y_test_one_hot
+
+def load_mat_data(path):
+    """ Helper function for loading a MAT-File"""
+    data = loadmat(path)
+    return data['X'], data['y']
+
+
+def load_svhn():
+    x_train, y_train = load_mat_data(str(_SVHN_DIR / 'train_32x32.mat'))
+    x_test, y_test = load_mat_data(str(_SVHN_DIR / 'test_32x32.mat'))
+    y_train = y_train.reshape(-1)
+    y_test = y_test.reshape(-1)
+    x_train = np.transpose(x_train, (3, 0, 1, 2))
+    x_test = np.transpose(x_test, (3, 0, 1, 2))
+    x_train = x_train.astype('float32') / 255.
+    x_test = x_test.astype('float32') / 255.
+    # io.imshow(x_test[3])
+    # io.show()
+    y_train[np.where(y_train == 10)] = 0
+    y_test[np.where(y_test == 10)] = 0
+    y_train_one_hot = tf.one_hot(y_train, 10)
+    y_test_one_hot = tf.one_hot(y_test, 10)
+    print("Training Set", x_train.shape, y_train.shape)
+    print("Test Set", x_test.shape, y_test.shape)
+
+    return x_train, y_train_one_hot, x_test, y_test_one_hot
 #
 #
 # def load_gtsrb():
