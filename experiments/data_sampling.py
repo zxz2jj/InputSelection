@@ -14,7 +14,7 @@ for _p in (_REPO_ROOT, _EXP_DIR):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from training_models.load_data import load_cifar10, load_fmnist
+from training_models.load_data import load_cifar10, load_fmnist, load_svhn
 
 
 ADVERSARIAL_PREFIXES = [
@@ -46,6 +46,10 @@ DATASET_CONFIG = {
     'cifar10': {
         'loader': load_cifar10,
         'model_path': _REPO_ROOT / 'models' / 'vgg19_cifar10' / 'tf_model.h5',
+    },
+    'svhn': {
+        'loader': load_svhn,
+        'model_path': _REPO_ROOT / 'models' / 'resnet18_svhn' / 'tf_model.h5',
     },
 }
 
@@ -429,6 +433,13 @@ def build_sampled_pool(
     }, metadata
 
 
+def pool_output_paths(out_root, dataset_name, pool_type, error_ratio, seed, sampling_mode):
+    ratio_name = f'error_ratio_{int(round(float(error_ratio) * 100)):02d}'
+    out_dir = Path(out_root) / dataset_name / pool_type / ratio_name
+    stem = f'seed_{int(seed)}_{sampling_mode}'
+    return out_dir / f'{stem}.npz', out_dir / f'{stem}.json'
+
+
 def save_pool(
     out_root,
     dataset_name,
@@ -440,12 +451,10 @@ def save_pool(
     metadata,
     overwrite,
 ):
-    ratio_name = f'error_ratio_{int(round(float(error_ratio) * 100)):02d}'
-    out_dir = Path(out_root) / dataset_name / pool_type / ratio_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f'seed_{int(seed)}_{sampling_mode}'
-    out_npz = out_dir / f'{stem}.npz'
-    out_json = out_dir / f'{stem}.json'
+    out_npz, out_json = pool_output_paths(
+        out_root, dataset_name, pool_type, error_ratio, seed, sampling_mode,
+    )
+    out_npz.parent.mkdir(parents=True, exist_ok=True)
     if out_npz.exists() and not overwrite:
         print(f'Skip existing {out_npz}')
         return
@@ -462,7 +471,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='Build mixed pools with random or high-confidence error sampling.',
     )
-    parser.add_argument('--datasets', nargs='+', default=['fmnist', 'cifar10'], choices=sorted(DATASET_CONFIG))
+    parser.add_argument('--datasets', nargs='+', default=['fmnist', 'cifar10', 'svhn'], choices=sorted(DATASET_CONFIG))
     parser.add_argument(
         '--pool-types',
         nargs='+',
@@ -568,6 +577,18 @@ def main():
                         continue
 
                     for seed in args.seeds:
+                        out_npz, _ = pool_output_paths(
+                            args.output_root,
+                            dataset_name,
+                            pool_type,
+                            error_ratio,
+                            seed,
+                            sampling_mode,
+                        )
+                        if out_npz.exists() and not args.overwrite:
+                            print(f'Skip existing {out_npz}')
+                            continue
+
                         arrays, metadata = build_sampled_pool(
                             correct_pool,
                             error_sources,

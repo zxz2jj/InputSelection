@@ -27,7 +27,7 @@ from tqdm import tqdm
 tf.get_logger().setLevel('ERROR')
 logging.getLogger().setLevel(logging.WARNING)
 
-from training_models.load_data import load_cifar10, load_fmnist
+from training_models.load_data import load_cifar10, load_fmnist, load_svhn
 from risk_scoring import (
     _batch_pred_class_is_min_distance,
     _hidden_to_flat_batch,
@@ -45,6 +45,7 @@ EXPLORE_POOL_TYPES = ('adversarial', 'transformation')
 EXPLORE_ERROR_RATIOS = (0.10, 0.20)
 # EXPLORE_SEEDS = (0, 1, 2, 3, 4)
 EXPLORE_SEEDS = (0,)
+EXPLORE_DATASETS = ('fmnist', 'cifar10', 'svhn')
 
 DATASET_CONFIG = {
     'fmnist': {
@@ -58,6 +59,12 @@ DATASET_CONFIG = {
         'model_path': _REPO_ROOT / 'models' / 'vgg19_cifar10' / 'tf_model.h5',
         'distance_layer_index': -5,
         'consistency_layer_indices': [-19, -15, -11, -5],
+    },
+    'svhn': {
+        'loader': load_svhn,
+        'model_path': _REPO_ROOT / 'models' / 'resnet18_svhn' / 'tf_model.h5',
+        'distance_layer_index': -4,  
+        'consistency_layer_indices': [-40, -23, -14, -4],
     },
 }
 
@@ -1418,13 +1425,90 @@ def evaluate_feature_subset(
     }
 
 
-def _metrics_for_json(eval_result, budgets=SEARCH_BUDGET_RATIOS):
+def evaluate_feature_subset_global(
+    pools_by_dataset,
+    feature_keys,
+    *,
+    budgets=SEARCH_BUDGET_RATIOS,
+    budget_weights=None,
+    lambda_all=SEARCH_LAMBDA_HIGH,
+    dataset_order=None,
+):
+    """Dataset-equal J_global = mean_d J_d(S) (scheme B)."""
+    if budget_weights is None:
+        budget_weights = SEARCH_BUDGET_WEIGHTS
+    if not pools_by_dataset:
+        raise ValueError('pools_by_dataset is empty')
+    if dataset_order is None:
+        dataset_order = sorted(pools_by_dataset.keys())
+    else:
+        dataset_order = [d for d in dataset_order if d in pools_by_dataset]
+        if not dataset_order:
+            raise ValueError('dataset_order empty after filtering')
+
+    keys = list(feature_keys)
+    per_dataset = {}
+    for ds in dataset_order:
+        pools = pools_by_dataset[ds]
+        if not pools:
+            raise ValueError(f'no pools for dataset={ds}')
+        per_dataset[ds] = evaluate_feature_subset(
+            pools, keys,
+            budgets=budgets,
+            budget_weights=budget_weights,
+            lambda_all=lambda_all,
+        )
+
+    j_global = float(np.mean([per_dataset[ds]['J'] for ds in dataset_order]))
+
+    def _mean_trc_maps(field):
+        out = {}
+        for b in budgets:
+            bf = float(b)
+            out[bf] = _mean_finite([per_dataset[ds][field][bf] for ds in dataset_order])
+        return out
+
+    trc_random = _mean_trc_maps('trc_random')
+    trc_high = _mean_trc_maps('trc_high_conf')
+    trc_all = _mean_trc_maps('trc_all')
+    j_random = float(np.mean([per_dataset[ds]['J_random_term'] for ds in dataset_order]))
+    j_high = float(np.mean([per_dataset[ds]['J_high_term'] for ds in dataset_order]))
+    n_pools = int(sum(per_dataset[ds]['n_pools'] for ds in dataset_order))
+
     return {
+        'feature_keys': keys,
+        'J': j_global,
+        'J_random_term': j_random,
+        'J_high_term': j_high,
+        'J_by_dataset': {ds: per_dataset[ds]['J'] for ds in dataset_order},
+        'trc_high_conf': trc_high,
+        'trc_all': trc_all,
+        'trc_random': trc_random,
+        'n_pools': n_pools,
+        'n_high_conf': int(sum(per_dataset[ds]['n_high_conf'] for ds in dataset_order)),
+        'n_random': int(sum(per_dataset[ds]['n_random'] for ds in dataset_order)),
+        'per_dataset': per_dataset,
+        'datasets': list(dataset_order),
+        'per_pool': [
+            row
+            for ds in dataset_order
+            for row in per_dataset[ds].get('per_pool', [])
+        ],
+    }
+
+
+def _metrics_for_json(eval_result, budgets=SEARCH_BUDGET_RATIOS):
+    out = {
         'J': eval_result['J'],
         'trc_high_conf': {_budget_key(b): eval_result['trc_high_conf'][float(b)] for b in budgets},
         'trc_all': {_budget_key(b): eval_result['trc_all'][float(b)] for b in budgets},
         'trc_random': {_budget_key(b): eval_result['trc_random'][float(b)] for b in budgets},
     }
+    if 'J_by_dataset' in eval_result:
+        out['J_by_dataset'] = {
+            ds: float(v) for ds, v in eval_result['J_by_dataset'].items()
+        }
+    return out
 
 
 def _trc_row_cells(trc_map, budgets=SEARCH_BUDGET_RATIOS):
@@ -1461,18 +1545,17 @@ def soft_family_blocks_candidate(
 
 
 def forward_greedy_search(
-    pools,
     candidates,
     *,
+    eval_fn,
     init_keys=SEARCH_INIT_KEYS,
     eps_stop=SEARCH_EPS_STOP,
     enable_family_soft_penalty=False,
     delta_family=SEARCH_DELTA_FAMILY,
     budgets=SEARCH_BUDGET_RATIOS,
-    budget_weights=None,
-    lambda_all=SEARCH_LAMBDA_ALL,
     eval_cache=None,
 ):
+    """Forward greedy maximizing eval_fn(S)['J']."""
     if eval_cache is None:
         eval_cache = {}
 
@@ -1480,12 +1563,7 @@ def forward_greedy_search(
         key_list = list(keys)
         fk = frozenset(key_list)
         if fk not in eval_cache:
-            eval_cache[fk] = evaluate_feature_subset(
-                pools, key_list,
-                budgets=budgets,
-                budget_weights=budget_weights,
-                lambda_all=lambda_all,
-            )
+            eval_cache[fk] = eval_fn(key_list)
         eval_cache[fk]['feature_keys'] = key_list
         return eval_cache[fk]
 
@@ -1576,32 +1654,23 @@ def forward_greedy_search(
 
 
 def backward_prune_search(
-    pools,
     feature_keys,
     *,
+    eval_fn,
     delta_prune=SEARCH_DELTA_PRUNE,
     keep_deepgini=False,
     budgets=SEARCH_BUDGET_RATIOS,
-    budget_weights=None,
-    lambda_all=SEARCH_LAMBDA_ALL,
     eval_cache=None,
 ):
     if eval_cache is None:
         eval_cache = {}
 
     def _cached(keys):
-        fk = frozenset(keys)
+        key_list = list(keys)
+        fk = frozenset(key_list)
         if fk not in eval_cache:
-            eval_cache[fk] = evaluate_feature_subset(
-                pools, list(keys),
-                budgets=budgets,
-                budget_weights=budget_weights,
-                lambda_all=lambda_all,
-            )
-            eval_cache[fk]['feature_keys'] = list(keys)
-        else:
-            # preserve current order for reporting
-            eval_cache[fk]['feature_keys'] = list(keys)
+            eval_cache[fk] = eval_fn(key_list)
+        eval_cache[fk]['feature_keys'] = key_list
         return eval_cache[fk]
 
     S = list(feature_keys)
@@ -1681,13 +1750,17 @@ def _load_search_pools(
     return pools
 
 
-def _write_single_feature_trc_outputs(out_dir, single_rows, budgets=SEARCH_BUDGET_RATIOS):
+def _write_single_feature_trc_outputs(
+    out_dir, single_rows, budgets=SEARCH_BUDGET_RATIOS, *, name_prefix='',
+):
     out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = f'{name_prefix}single_feature_trc'
     payload = {
         'budgets': [float(b) for b in budgets],
         'rows': single_rows,
     }
-    (out_dir / 'single_feature_trc.json').write_text(
+    (out_dir / f'{stem}.json').write_text(
         json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8',
     )
 
@@ -1703,7 +1776,7 @@ def _write_single_feature_trc_outputs(out_dir, single_rows, budgets=SEARCH_BUDGE
             [row['feature'], _fmt(row['J'])]
             + _trc_row_cells(row['trc_random'], budgets)
             + _trc_row_cells(row['trc_high_conf'], budgets)
-            + [str(row['n_pools'])]
+            + [str(row.get('n_pools', ''))]
         )
     md = [
         '# Single-feature TRC (Dev, diagnostic)',
@@ -1713,12 +1786,14 @@ def _write_single_feature_trc_outputs(out_dir, single_rows, budgets=SEARCH_BUDGE
         _markdown_table(headers, md_rows),
         '',
     ]
-    (out_dir / 'single_feature_trc.md').write_text('\n'.join(md), encoding='utf-8')
+    (out_dir / f'{stem}.md').write_text('\n'.join(md), encoding='utf-8')
 
 
-def _write_greedy_path_outputs(out_dir, path, budgets=SEARCH_BUDGET_RATIOS):
+def _write_greedy_path_outputs(out_dir, path, budgets=SEARCH_BUDGET_RATIOS, *, name_prefix=''):
     out_dir = Path(out_dir)
-    (out_dir / 'greedy_path.json').write_text(
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = f'{name_prefix}greedy_path'
+    (out_dir / f'{stem}.json').write_text(
         json.dumps({'path': path}, indent=2, ensure_ascii=False), encoding='utf-8',
     )
     headers = (
@@ -1756,22 +1831,26 @@ def _write_greedy_path_outputs(out_dir, path, budgets=SEARCH_BUDGET_RATIOS):
         _markdown_table(headers, md_rows),
         '',
     ]
-    (out_dir / 'greedy_path.md').write_text('\n'.join(md), encoding='utf-8')
+    (out_dir / f'{stem}.md').write_text('\n'.join(md), encoding='utf-8')
 
 
-def _write_prune_log_outputs(out_dir, log, budgets=SEARCH_BUDGET_RATIOS):
+def _write_prune_log_outputs(out_dir, log, budgets=SEARCH_BUDGET_RATIOS, *, name_prefix=''):
     out_dir = Path(out_dir)
-    (out_dir / 'prune_log.json').write_text(
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = f'{name_prefix}prune_log'
+    (out_dir / f'{stem}.json').write_text(
         json.dumps({'log': log}, indent=2, ensure_ascii=False), encoding='utf-8',
     )
     headers = (
         ['step', 'action', 'removed', 'drop', 'J']
+        + [f'TRC_rand@{_budget_key(b)}' for b in budgets]
         + [f'TRC_high@{_budget_key(b)}' for b in budgets]
         + ['S']
     )
     md_rows = []
     for step in log:
         m = step.get('metrics') or {}
+        rand_map = {float(b): m.get('trc_random', {}).get(_budget_key(b), np.nan) for b in budgets}
         high_map = {float(b): m.get('trc_high_conf', {}).get(_budget_key(b), np.nan) for b in budgets}
         md_rows.append(
             [
@@ -1781,6 +1860,7 @@ def _write_prune_log_outputs(out_dir, log, budgets=SEARCH_BUDGET_RATIOS):
                 _fmt(step.get('drop')) if step.get('drop') is not None else '-',
                 _fmt(step.get('J')),
             ]
+            + _trc_row_cells(rand_map, budgets)
             + _trc_row_cells(high_map, budgets)
             + [', '.join(step.get('S') or [])]
         )
@@ -1792,11 +1872,16 @@ def _write_prune_log_outputs(out_dir, log, budgets=SEARCH_BUDGET_RATIOS):
         _markdown_table(headers, md_rows),
         '',
     ]
-    (out_dir / 'prune_log.md').write_text('\n'.join(md), encoding='utf-8')
+    (out_dir / f'{stem}.md').write_text('\n'.join(md), encoding='utf-8')
 
 
-def _write_comparison_md(out_dir, star_eval, gini_eval, budgets=SEARCH_BUDGET_RATIOS):
+def _write_comparison_md(
+    out_dir, star_eval, gini_eval, budgets=SEARCH_BUDGET_RATIOS,
+    *, name_prefix='', title=None,
+):
     out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = f'{name_prefix}comparison'
     headers = (
         ['method', 'aggregate', 'J']
         + [f'TRC@{_budget_key(b)}' for b in budgets]
@@ -1819,7 +1904,6 @@ def _write_comparison_md(out_dir, star_eval, gini_eval, budgets=SEARCH_BUDGET_RA
                 + [str(len(ev['feature_keys'])) if agg_name == 'random' else '-']
             )
 
-    # per-dataset high_conf / all from per_pool
     by_ds = {}
     for ev_name, ev in (('deepgini', gini_eval), ('S*', star_eval)):
         for row in ev.get('per_pool') or []:
@@ -1848,15 +1932,25 @@ def _write_comparison_md(out_dir, star_eval, gini_eval, budgets=SEARCH_BUDGET_RA
         extra.append(_markdown_table(ds_headers, ds_rows))
         extra.append('')
 
+    if title is None:
+        title = 'S* vs DeepGini (pure risk-ranking TRC)'
     md = [
-        '# S* vs DeepGini (pure risk-ranking TRC)',
+        f'# {title}',
         '',
         'Primary selection uses $J(S)$; DeepGini is a soft reference only.',
         '',
         _markdown_table(headers, rows),
         *extra,
     ]
-    (out_dir / 'comparison.md').write_text('\n'.join(md), encoding='utf-8')
+    (out_dir / f'{stem}.md').write_text('\n'.join(md), encoding='utf-8')
+    (out_dir / f'{stem}.json').write_text(
+        json.dumps({
+            'star': _metrics_for_json(star_eval, budgets=budgets),
+            'deepgini': _metrics_for_json(gini_eval, budgets=budgets),
+            'star_keys': list(star_eval.get('feature_keys') or []),
+        }, indent=2, ensure_ascii=False),
+        encoding='utf-8',
+    )
 
 
 def _resolve_search_seeds(seeds):
@@ -1959,14 +2053,18 @@ def _run_feature_search_one_dataset(
 
     print(f'[search:{dataset_name}] Step A: single-feature TRC')
     eval_cache = {}
-    single_rows = []
-    for f in tqdm(candidates, desc=f'{dataset_name} single-feature'):
-        ev = evaluate_feature_subset(
-            dev_pools, [f],
+
+    def _eval_local(keys):
+        return evaluate_feature_subset(
+            dev_pools, list(keys),
             budgets=budgets,
             budget_weights=budget_weights,
             lambda_all=lambda_all,
         )
+
+    single_rows = []
+    for f in tqdm(candidates, desc=f'{dataset_name} single-feature'):
+        ev = _eval_local([f])
         eval_cache[frozenset([f])] = ev
         single_rows.append({
             'feature': f,
@@ -1980,15 +2078,13 @@ def _run_feature_search_one_dataset(
 
     print(f'[search:{dataset_name}] Step B: forward greedy')
     fwd = forward_greedy_search(
-        dev_pools,
         candidates,
+        eval_fn=_eval_local,
         init_keys=SEARCH_INIT_KEYS,
         eps_stop=eps_stop,
         enable_family_soft_penalty=enable_family_soft_penalty,
         delta_family=delta_family,
         budgets=budgets,
-        budget_weights=budget_weights,
-        lambda_all=lambda_all,
         eval_cache=eval_cache,
     )
     _write_greedy_path_outputs(out_dir, fwd['path'], budgets=budgets)
@@ -1999,25 +2095,18 @@ def _run_feature_search_one_dataset(
 
     print(f'[search:{dataset_name}] Step C: backward prune')
     prn = backward_prune_search(
-        dev_pools,
         fwd['S'],
+        eval_fn=_eval_local,
         delta_prune=delta_prune,
         keep_deepgini=keep_deepgini,
         budgets=budgets,
-        budget_weights=budget_weights,
-        lambda_all=lambda_all,
         eval_cache=fwd['eval_cache'],
     )
     _write_prune_log_outputs(out_dir, prn['log'], budgets=budgets)
 
     star_keys = prn['S']
     star_eval = prn['eval']
-    gini_eval = evaluate_feature_subset(
-        dev_pools, list(SEARCH_INIT_KEYS),
-        budgets=budgets,
-        budget_weights=budget_weights,
-        lambda_all=lambda_all,
-    )
+    gini_eval = _eval_local(list(SEARCH_INIT_KEYS))
     _write_comparison_md(out_dir, star_eval, gini_eval, budgets=budgets)
 
     test_metrics = None
@@ -2227,6 +2316,381 @@ def _write_cross_dataset_summary(
     return summary
 
 
+def _write_global_feature_exploration_summary(
+    summary_md_path,
+    global_payload,
+    budgets=SEARCH_BUDGET_RATIOS,
+    *,
+    per_dataset_adaptive=None,
+):
+    """Write cache_files/global_feature_exploration_summary.md (+ .json)."""
+    summary_md_path = Path(summary_md_path)
+    summary_md_path.parent.mkdir(parents=True, exist_ok=True)
+    star_keys = list(global_payload['feature_keys'])
+    per_ds_metrics = global_payload['metrics']['dev_by_dataset']
+    gini_by_ds = global_payload['reference_deepgini']['by_dataset']
+
+    delta_rows = {}
+    for ds, m in per_ds_metrics.items():
+        g = gini_by_ds[ds]
+        delta_rows[ds] = {
+            _budget_key(b): float(m['trc_random'][_budget_key(b)] - g['trc_random'][_budget_key(b)])
+            for b in budgets
+        }
+
+    summary = {
+        'scope': 'global',
+        'feature_keys': star_keys,
+        'J_global': global_payload['metrics']['dev']['J'],
+        'J_deepgini_global': global_payload['reference_deepgini']['J'],
+        'metrics_by_dataset': per_ds_metrics,
+        'delta_trc_random_vs_deepgini': delta_rows,
+        'reference_deepgini_by_dataset': gini_by_ds,
+        'artifacts': global_payload.get('artifacts', {}),
+    }
+    if per_dataset_adaptive:
+        adaptive_keys = {
+            ds: list(per_dataset_adaptive[ds]['feature_keys'])
+            for ds in per_dataset_adaptive
+        }
+        summary['adaptive_feature_keys_by_dataset'] = adaptive_keys
+        summary['adaptive_vs_global'] = {
+            ds: {
+                'identical_to_global': set(adaptive_keys[ds]) == set(star_keys),
+                'only_adaptive': sorted(set(adaptive_keys[ds]) - set(star_keys)),
+                'only_global': sorted(set(star_keys) - set(adaptive_keys[ds])),
+            }
+            for ds in adaptive_keys
+        }
+
+    summary_md_path.with_suffix('.json').write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding='utf-8',
+    )
+
+    headers = (
+        ['dataset', 'n_feat', 'J_d', 'J_deepgini']
+        + [f'TRC_rand@{_budget_key(b)}' for b in budgets]
+        + [f'delta_rand@{_budget_key(b)}' for b in budgets]
+        + [f'TRC_high@{_budget_key(b)}' for b in budgets]
+    )
+    rows = []
+    for ds in sorted(per_ds_metrics.keys()):
+        m = per_ds_metrics[ds]
+        g = gini_by_ds[ds]
+        rows.append(
+            [
+                ds,
+                str(len(star_keys)),
+                _fmt(m['J']),
+                _fmt(g['J']),
+            ]
+            + [_fmt(m['trc_random'][_budget_key(b)]) for b in budgets]
+            + [_fmt(delta_rows[ds][_budget_key(b)]) for b in budgets]
+            + [_fmt(m['trc_high_conf'][_budget_key(b)]) for b in budgets]
+        )
+
+    md = [
+        '# Global feature exploration summary',
+        '',
+        f'**S_global** ({len(star_keys)}): {", ".join(star_keys)}',
+        '',
+        f'$J_{{\\mathrm{{global}}}}(S^*)$ = {_fmt(global_payload["metrics"]["dev"]["J"])} '
+        f'(DeepGini {_fmt(global_payload["reference_deepgini"]["J"])})',
+        '',
+        'Primary = random TRC; secondary = $\\lambda$ · high_conf. '
+        '$J_{\\mathrm{global}}=\\mathrm{mean}_d J_d$ (dataset-equal).',
+        '',
+        '## Per-dataset TRC under S_global',
+        '',
+        _markdown_table(headers, rows),
+        '',
+        '## Delta random TRC vs DeepGini (S_global - deepgini)',
+        '',
+    ]
+    d_headers = ['dataset'] + [f'delta@{_budget_key(b)}' for b in budgets]
+    d_rows = [
+        [ds] + [_fmt(delta_rows[ds][_budget_key(b)]) for b in budgets]
+        for ds in sorted(delta_rows)
+    ]
+    md.append(_markdown_table(d_headers, d_rows))
+    md.append('')
+
+    if per_dataset_adaptive:
+        md.extend(['## Adaptive S* (per_dataset) vs S_global', ''])
+        a_headers = ['dataset', 'n_feat', 'feature_keys', 'identical']
+        a_rows = []
+        for ds in sorted(per_dataset_adaptive):
+            keys = list(per_dataset_adaptive[ds]['feature_keys'])
+            a_rows.append([
+                ds,
+                str(len(keys)),
+                ', '.join(keys),
+                'yes' if set(keys) == set(star_keys) else 'no',
+            ])
+        md.append(_markdown_table(a_headers, a_rows))
+        md.append('')
+
+    md.extend([
+        '## Artifacts',
+        '',
+        f'- Top-level: `{summary_md_path.parent.as_posix()}/global_*`',
+        '- Per-dataset eval: `cache_files/{dataset}/feature_search/global_*`',
+        '',
+    ])
+    summary_md_path.write_text('\n'.join(md), encoding='utf-8')
+    return summary
+
+
+def _run_feature_search_global(
+    feature_cache_dir,
+    sampled_root,
+    datasets,
+    pool_types,
+    error_ratios,
+    available_seeds,
+    dev_seeds,
+    test_seeds,
+    seed_note,
+    sampling_modes,
+    *,
+    lambda_all,
+    eps_stop,
+    delta_prune,
+    keep_deepgini,
+    enable_family_soft_penalty,
+    delta_family,
+    budgets,
+    budget_weights,
+    summary_path=None,
+    per_dataset_adaptive=None,
+):
+    """Optimize one S*_global via dataset-equal J_global; write global_* artifacts."""
+    feature_cache_dir = Path(feature_cache_dir)
+    dataset_list = list(datasets)
+    candidates = list(CONTINUOUS_RISK_FEATURE_KEYS)
+
+    pools_by_dataset = {}
+    for ds in dataset_list:
+        all_pools = _load_search_pools(
+            feature_cache_dir, sampled_root, [ds], pool_types,
+            error_ratios, available_seeds, sampling_modes,
+        )
+        dev_pools = [p for p in all_pools if p['seed'] in set(dev_seeds)]
+        if not dev_pools:
+            raise RuntimeError(f'No Dev pools for dataset={ds}')
+        pools_by_dataset[ds] = dev_pools
+        print(f'[search:global] {ds}: Dev pools={len(dev_pools)}')
+
+    if summary_path is None:
+        summary_path = feature_cache_dir / 'global_feature_exploration_summary.md'
+    else:
+        summary_path = Path(summary_path)
+
+    config = {
+        'scope': 'global',
+        'aggregation': 'dataset_equal_mean_J_d',
+        'timestamp_utc': datetime.now(timezone.utc).isoformat(),
+        'datasets': dataset_list,
+        'budgets': [float(b) for b in budgets],
+        'budget_weights': {_budget_key(b): float(budget_weights[float(b)]) for b in budgets},
+        'lambda_high': float(lambda_all),
+        'eps_stop': float(eps_stop),
+        'delta_prune': float(delta_prune),
+        'init': list(SEARCH_INIT_KEYS),
+        'keep_deepgini': bool(keep_deepgini),
+        'enable_family_soft_penalty': bool(enable_family_soft_penalty),
+        'delta_family': float(delta_family),
+        'candidates': candidates,
+        'dev_seeds': list(dev_seeds),
+        'test_seeds': list(test_seeds),
+        'seed_note': seed_note,
+        'objective': (
+            'J_global=mean_d J_d; '
+            'J_d=sum_b w_b*TRC_rand + lambda*sum_b w_b*TRC_high'
+        ),
+    }
+    (feature_cache_dir / 'global_search_config.json').write_text(
+        json.dumps(config, indent=2, ensure_ascii=False), encoding='utf-8',
+    )
+
+    def _eval_global(keys):
+        return evaluate_feature_subset_global(
+            pools_by_dataset, list(keys),
+            budgets=budgets,
+            budget_weights=budget_weights,
+            lambda_all=lambda_all,
+            dataset_order=dataset_list,
+        )
+
+    print('[search:global] Step A: single-feature TRC (J_global)')
+    eval_cache = {}
+    single_rows = []
+    for f in tqdm(candidates, desc='global single-feature'):
+        ev = _eval_global([f])
+        eval_cache[frozenset([f])] = ev
+        single_rows.append({
+            'feature': f,
+            'J': ev['J'],
+            'trc_high_conf': ev['trc_high_conf'],
+            'trc_all': ev['trc_all'],
+            'trc_random': ev['trc_random'],
+            'n_pools': ev['n_pools'],
+            'J_by_dataset': ev.get('J_by_dataset'),
+        })
+    _write_single_feature_trc_outputs(
+        feature_cache_dir, single_rows, budgets=budgets, name_prefix='global_',
+    )
+
+    print('[search:global] Step B: forward greedy')
+    fwd = forward_greedy_search(
+        candidates,
+        eval_fn=_eval_global,
+        init_keys=SEARCH_INIT_KEYS,
+        eps_stop=eps_stop,
+        enable_family_soft_penalty=enable_family_soft_penalty,
+        delta_family=delta_family,
+        budgets=budgets,
+        eval_cache=eval_cache,
+    )
+    _write_greedy_path_outputs(
+        feature_cache_dir, fwd['path'], budgets=budgets, name_prefix='global_',
+    )
+    print(f"[search:global] after forward: |S|={len(fwd['S'])}, J={_fmt(fwd['eval']['J'])}")
+
+    print('[search:global] Step C: backward prune')
+    prn = backward_prune_search(
+        fwd['S'],
+        eval_fn=_eval_global,
+        delta_prune=delta_prune,
+        keep_deepgini=keep_deepgini,
+        budgets=budgets,
+        eval_cache=fwd['eval_cache'],
+    )
+    _write_prune_log_outputs(
+        feature_cache_dir, prn['log'], budgets=budgets, name_prefix='global_',
+    )
+
+    star_keys = prn['S']
+    star_eval = prn['eval']
+    gini_eval = _eval_global(list(SEARCH_INIT_KEYS))
+
+    artifacts = {
+        'top_level': str(feature_cache_dir),
+        'per_dataset': {},
+    }
+    dev_by_dataset = {}
+    gini_by_dataset = {}
+    for ds in dataset_list:
+        ds_dir = feature_cache_dir / ds / 'feature_search'
+        ds_dir.mkdir(parents=True, exist_ok=True)
+        ds_star = star_eval['per_dataset'][ds]
+        ds_gini = gini_eval['per_dataset'][ds]
+        # ensure feature_keys present for comparison writer
+        ds_star = {**ds_star, 'feature_keys': list(star_keys)}
+        ds_gini = {**ds_gini, 'feature_keys': list(SEARCH_INIT_KEYS)}
+        _write_comparison_md(
+            ds_dir, ds_star, ds_gini, budgets=budgets,
+            name_prefix='global_',
+            title=f'S_global vs DeepGini on {ds}',
+        )
+        eval_metrics = {
+            'dataset': ds,
+            'scope': 'global_eval',
+            'feature_keys': star_keys,
+            'metrics': _metrics_for_json(ds_star, budgets=budgets),
+            'reference_deepgini': _metrics_for_json(ds_gini, budgets=budgets),
+            'J_global': star_eval['J'],
+        }
+        (ds_dir / 'global_eval_metrics.json').write_text(
+            json.dumps(eval_metrics, indent=2, ensure_ascii=False), encoding='utf-8',
+        )
+        keys_payload = {
+            'dataset': ds,
+            'scope': 'global',
+            'feature_keys': star_keys,
+            'metrics': _metrics_for_json(ds_star, budgets=budgets),
+            'reference_deepgini': _metrics_for_json(ds_gini, budgets=budgets),
+            'note': 'Same S*_global as cache_files/global_best_feature_keys.json',
+        }
+        (ds_dir / 'global_feature_keys.json').write_text(
+            json.dumps(keys_payload, indent=2, ensure_ascii=False), encoding='utf-8',
+        )
+        artifacts['per_dataset'][ds] = str(ds_dir)
+        dev_by_dataset[ds] = _metrics_for_json(ds_star, budgets=budgets)
+        gini_by_dataset[ds] = _metrics_for_json(ds_gini, budgets=budgets)
+
+    best_payload = {
+        'scope': 'global',
+        'feature_keys': star_keys,
+        'selection_criterion': {
+            'name': 'J_global_dataset_equal',
+            'search': 'argmax J_global via forward_greedy + backward_prune',
+            'formula': (
+                'J_global=mean_d J_d; '
+                'J_d=sum_b w_b*mean_TRC_random + lambda*sum_b w_b*mean_TRC_high'
+            ),
+            'primary_term': 'random_trc',
+            'secondary_term': 'high_conf_trc',
+            'aggregation': 'dataset_equal_mean',
+            'budgets': [float(b) for b in budgets],
+            'budget_weights': {_budget_key(b): float(budget_weights[float(b)]) for b in budgets},
+            'lambda_high': float(lambda_all),
+            'eps_stop': float(eps_stop),
+            'delta_prune': float(delta_prune),
+            'init': list(SEARCH_INIT_KEYS),
+            'keep_deepgini': bool(keep_deepgini),
+            'enable_family_soft_penalty': bool(enable_family_soft_penalty),
+        },
+        'datasets': dataset_list,
+        'dev_seeds': list(dev_seeds),
+        'test_seeds': list(test_seeds),
+        'seed_note': seed_note,
+        'forward_S': fwd['S'],
+        'metrics': {
+            'dev': _metrics_for_json(star_eval, budgets=budgets),
+            'dev_by_dataset': dev_by_dataset,
+        },
+        'reference_deepgini': {
+            'J': gini_eval['J'],
+            'trc_random': {
+                _budget_key(b): gini_eval['trc_random'][float(b)] for b in budgets
+            },
+            'trc_high_conf': {
+                _budget_key(b): gini_eval['trc_high_conf'][float(b)] for b in budgets
+            },
+            'by_dataset': gini_by_dataset,
+            'note': 'for comparison only',
+        },
+        'artifacts': artifacts,
+    }
+    (feature_cache_dir / 'global_best_feature_keys.json').write_text(
+        json.dumps(best_payload, indent=2, ensure_ascii=False), encoding='utf-8',
+    )
+
+    summary = _write_global_feature_exploration_summary(
+        summary_path,
+        best_payload,
+        budgets=budgets,
+        per_dataset_adaptive=per_dataset_adaptive,
+    )
+
+    print(f'[search:global] S* ({len(star_keys)}): {star_keys}')
+    print(
+        f"[search:global] J_global(S*)={_fmt(star_eval['J'])}  "
+        f"J_global(deepgini)={_fmt(gini_eval['J'])}",
+    )
+    for ds in dataset_list:
+        m = dev_by_dataset[ds]
+        g = gini_by_dataset[ds]
+        deltas = [
+            f"{_budget_key(b)}={_fmt(m['trc_random'][_budget_key(b)] - g['trc_random'][_budget_key(b)])}"
+            for b in budgets
+        ]
+        print(f"[search:global]   {ds} delta_rand: {', '.join(deltas)}")
+    print(f'[search:global] summary -> {summary_path}')
+    return best_payload, summary
+
+
 def run_feature_search(
     feature_cache_dir,
     sampled_root,
@@ -2237,6 +2701,7 @@ def run_feature_search(
     sampling_modes,
     summary_path=None,
     *,
+    search_scope='global',
     lambda_all=SEARCH_LAMBDA_ALL,
     eps_stop=SEARCH_EPS_STOP,
     delta_prune=SEARCH_DELTA_PRUNE,
@@ -2247,33 +2712,45 @@ def run_feature_search(
     budget_weights=None,
 ):
     """
-    Explore risk feature combinations via J(S) + forward greedy + backward prune.
+    Feature-subset search.
 
-    Per-dataset artifacts: cache_files/{dataset}/feature_search/
-    Cross-dataset summary: cache_files/feature_exploration_summary.md
-    Does not modify selection_method/risk_scoring.py defaults.
+    search_scope:
+      - global: dataset-equal J_global → cache_files/global_* + per-ds global_* eval
+      - per_dataset: each dataset → cache_files/{ds}/feature_search/ + feature_exploration_summary
+      - both: global then per_dataset (rewrite global summary with adaptive contrast)
     """
     if budget_weights is None:
         budget_weights = dict(SEARCH_BUDGET_WEIGHTS)
-    feature_cache_dir = Path(feature_cache_dir)
-    if summary_path is None:
-        summary_path = feature_cache_dir / 'feature_exploration_summary.md'
-    else:
-        summary_path = Path(summary_path)
+    if search_scope not in ('global', 'per_dataset', 'both'):
+        raise ValueError(f'unknown search_scope={search_scope!r}')
 
+    feature_cache_dir = Path(feature_cache_dir)
     available_seeds, dev_seeds, test_seeds, seed_note = _resolve_search_seeds(seeds)
     dataset_list = list(datasets)
+    result = {'search_scope': search_scope}
 
-    per_dataset = {}
-    per_dataset_dirs = {}
-    for dataset_name in dataset_list:
-        ds_out = feature_cache_dir / dataset_name / 'feature_search'
-        per_dataset_dirs[dataset_name] = ds_out
-        print(f'[search] ===== dataset={dataset_name} =====')
-        per_dataset[dataset_name] = _run_feature_search_one_dataset(
-            dataset_name=dataset_name,
+    common_kw = dict(
+        lambda_all=lambda_all,
+        eps_stop=eps_stop,
+        delta_prune=delta_prune,
+        keep_deepgini=keep_deepgini,
+        enable_family_soft_penalty=enable_family_soft_penalty,
+        delta_family=delta_family,
+        budgets=budgets,
+        budget_weights=budget_weights,
+    )
+
+    global_payload = None
+    global_summary_path = feature_cache_dir / 'global_feature_exploration_summary.md'
+    if search_scope == 'global' and summary_path is not None:
+        global_summary_path = Path(summary_path)
+
+    if search_scope in ('global', 'both'):
+        print('[search] ===== scope=global =====')
+        global_payload, global_summary = _run_feature_search_global(
             feature_cache_dir=feature_cache_dir,
             sampled_root=sampled_root,
+            datasets=dataset_list,
             pool_types=pool_types,
             error_ratios=error_ratios,
             available_seeds=available_seeds,
@@ -2281,35 +2758,61 @@ def run_feature_search(
             test_seeds=test_seeds,
             seed_note=seed_note,
             sampling_modes=sampling_modes,
-            out_dir=ds_out,
-            lambda_all=lambda_all,
-            eps_stop=eps_stop,
-            delta_prune=delta_prune,
-            keep_deepgini=keep_deepgini,
-            enable_family_soft_penalty=enable_family_soft_penalty,
-            delta_family=delta_family,
-            budgets=budgets,
-            budget_weights=budget_weights,
+            summary_path=global_summary_path,
+            per_dataset_adaptive=None,
+            **common_kw,
         )
+        result['global'] = global_payload
+        result['global_summary'] = global_summary
+        result['global_summary_path'] = str(global_summary_path)
 
-    summary = _write_cross_dataset_summary(
-        summary_path,
-        per_dataset,
-        budgets=budgets,
-        per_dataset_dirs=per_dataset_dirs,
-    )
-    print(f"[search] cross-dataset verdict: {summary['verdict']}")
-    for ds, keys in summary['feature_keys_by_dataset'].items():
-        print(f'[search]   {ds}: {keys}')
-        print(f'[search]   artifacts -> {per_dataset_dirs[ds]}')
-    print(f'[search] summary -> {summary_path}')
-    return {
-        'scope': 'per_dataset',
-        'per_dataset': per_dataset,
-        'summary': summary,
-        'summary_path': str(summary_path),
-        'artifact_dirs': {ds: str(p) for ds, p in per_dataset_dirs.items()},
-    }
+    per_dataset = None
+    if search_scope in ('per_dataset', 'both'):
+        adaptive_summary_path = feature_cache_dir / 'feature_exploration_summary.md'
+        if search_scope == 'per_dataset' and summary_path is not None:
+            adaptive_summary_path = Path(summary_path)
+        per_dataset = {}
+        per_dataset_dirs = {}
+        for dataset_name in dataset_list:
+            ds_out = feature_cache_dir / dataset_name / 'feature_search'
+            per_dataset_dirs[dataset_name] = ds_out
+            print(f'[search] ===== per_dataset={dataset_name} =====')
+            per_dataset[dataset_name] = _run_feature_search_one_dataset(
+                dataset_name=dataset_name,
+                feature_cache_dir=feature_cache_dir,
+                sampled_root=sampled_root,
+                pool_types=pool_types,
+                error_ratios=error_ratios,
+                available_seeds=available_seeds,
+                dev_seeds=dev_seeds,
+                test_seeds=test_seeds,
+                seed_note=seed_note,
+                sampling_modes=sampling_modes,
+                out_dir=ds_out,
+                **common_kw,
+            )
+        adaptive_summary = _write_cross_dataset_summary(
+            adaptive_summary_path,
+            per_dataset,
+            budgets=budgets,
+            per_dataset_dirs=per_dataset_dirs,
+        )
+        print(f"[search] per_dataset verdict: {adaptive_summary['verdict']}")
+        print(f'[search] per_dataset summary -> {adaptive_summary_path}')
+        result['per_dataset'] = per_dataset
+        result['per_dataset_summary'] = adaptive_summary
+        result['per_dataset_summary_path'] = str(adaptive_summary_path)
+
+        if search_scope == 'both' and global_payload is not None:
+            # rewrite global summary with adaptive contrast section
+            result['global_summary'] = _write_global_feature_exploration_summary(
+                global_summary_path,
+                global_payload,
+                budgets=budgets,
+                per_dataset_adaptive=per_dataset,
+            )
+
+    return result
 
 
 def parse_args():
@@ -2325,7 +2828,12 @@ def parse_args():
         default='all',
         help='compute | analyze | correlate | search | compute+analyze+correlate',
     )
-    parser.add_argument('--datasets', nargs='+', default=['fmnist', 'cifar10'], choices=sorted(DATASET_CONFIG))
+    parser.add_argument(
+        '--datasets',
+        nargs='+',
+        default=list(EXPLORE_DATASETS),
+        choices=sorted(DATASET_CONFIG),
+    )
     parser.add_argument('--pool-types', nargs='+', default=list(EXPLORE_POOL_TYPES), choices=list(EXPLORE_POOL_TYPES))
     parser.add_argument('--error-ratios', nargs='+', type=float, default=list(EXPLORE_ERROR_RATIOS))
     parser.add_argument('--seeds', nargs='+', type=int, default=list(EXPLORE_SEEDS))
@@ -2363,9 +2871,18 @@ def parse_args():
         help='minimum error samples in a pool to compute correlation',
     )
     parser.add_argument(
+        '--search-scope',
+        choices=('global', 'per_dataset', 'both'),
+        default='global',
+        help='feature search scope (default: global)',
+    )
+    parser.add_argument(
         '--summary-path',
-        default=str(CACHE_ROOT / 'feature_exploration_summary.md'),
-        help='cross-dataset summary markdown path (default: experiments/cache_files/feature_exploration_summary.md)',
+        default=None,
+        help=(
+            'optional summary markdown path; default depends on --search-scope '
+            '(global_feature_exploration_summary.md or feature_exploration_summary.md)'
+        ),
     )
     parser.add_argument('--search-lambda', type=float, default=SEARCH_LAMBDA_ALL)
     parser.add_argument('--eps-stop', type=float, default=SEARCH_EPS_STOP)
@@ -2423,7 +2940,7 @@ def main():
             linkage_method=args.corr_linkage,
             min_errors=args.corr_min_errors,
         )
-    if args.phase == 'search':
+    if args.phase in ('search', 'all'):
         run_feature_search(
             feature_cache_dir=args.cache_root,
             sampled_root=args.sampled_root,
@@ -2433,6 +2950,7 @@ def main():
             seeds=args.seeds,
             sampling_modes=args.sampling_modes,
             summary_path=args.summary_path,
+            search_scope=args.search_scope,
             lambda_all=args.search_lambda,
             eps_stop=args.eps_stop,
             delta_prune=args.delta_prune,
