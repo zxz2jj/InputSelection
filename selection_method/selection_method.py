@@ -18,6 +18,7 @@ from pseudo_labelling import build_or_load_snorkel_result_from_risk_features
 from risk_scoring import (
     _hidden_to_flat_batch,
     build_or_load_class_prototypes_dict,
+    build_or_load_mahalanobis_stats,
     build_or_load_risk_features,
     risk_scoring_function,
 )
@@ -820,6 +821,15 @@ if __name__ == '__main__':
     )
     print('prototypes_by_layer', {k: v.shape for k, v in prototypes_by_layer.items()})
 
+    class_means, class_inv_covs = build_or_load_mahalanobis_stats(
+        cnn_model,
+        train_data=x_train,
+        train_labels=y_train,
+        layer_index=distance_layer_index,
+        dataset_name=data_name,
+        batch_size=64,
+    )
+
     y_test_pred = np.argmax(cnn_model.predict(x_test, batch_size=64, verbose=0), axis=-1)
     correct_mask = (y_test_pred == y_test)
     correct_x_test = x_test[correct_mask]
@@ -879,6 +889,8 @@ if __name__ == '__main__':
                 distance_feature_layer_index=distance_layer_index,
                 consistency_feature_layer_indices=consistency_layer_indices,
                 batch_size=16,
+                class_means=class_means,
+                class_inv_covs=class_inv_covs,
             )
             risk_scores = risk_scoring_function(
                 combined_risk_features,

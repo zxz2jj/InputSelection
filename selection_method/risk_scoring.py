@@ -360,6 +360,129 @@ def image_data_augmentation(x, transform_id=None):
     raise ValueError(f'unknown transform_id={transform_id!r} (expected 1–5 or None)')
 
 
+# Global S* from experiments/Ablation_risk_feature_exploration.py (pool-level J_global).
+DEFAULT_RISK_FEATURE_KEYS = (
+    'deepgini',
+    'stability_class_change_rate',
+    'mahalanobis_dist_pred_class',
+    'stability_entropy_variance',
+)
+
+
+def _as_label_vector(arr):
+    out = np.asarray(arr)
+    if out.ndim > 1:
+        out = np.argmax(out, axis=-1)
+    return out.reshape(-1).astype(np.int64, copy=False)
+
+
+def _batch_mahalanobis_dist_pred_class(hid_flat, pred, class_means, class_inv_covs):
+    """Mahalanobis distance to predicted-class train stats; higher => higher risk."""
+    hid_flat = np.asarray(hid_flat, dtype=np.float64)
+    pred = np.asarray(pred, dtype=np.int64).reshape(-1)
+    B = hid_flat.shape[0]
+    out = np.full(B, np.nan, dtype=np.float64)
+    if not class_means or not class_inv_covs:
+        return out.astype(np.float32)
+    for i in range(B):
+        p = int(pred[i])
+        if p not in class_means or p not in class_inv_covs:
+            continue
+        diff = hid_flat[i] - class_means[p]
+        quad = float(diff @ class_inv_covs[p] @ diff)
+        if quad >= 0.0 and np.isfinite(quad):
+            out[i] = np.sqrt(quad)
+    return out.astype(np.float32)
+
+
+def build_or_load_mahalanobis_stats(
+    model,
+    train_data,
+    train_labels,
+    layer_index,
+    dataset_name,
+    *,
+    batch_size=64,
+    cache_root=None,
+    force_recompute=False,
+    cov_eps=1e-4,
+):
+    """Fit per-class mean / inv-cov on correctly classified train samples at layer_index."""
+    layer_index = int(layer_index)
+    if cache_root is None:
+        cache_root = Path(__file__).resolve().parent.parent / 'data'
+    cache_dir = Path(cache_root) / dataset_name
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f'mahalanobis_stats_layer_{layer_index}.npz'
+
+    if cache_path.is_file() and not force_recompute:
+        z = np.load(cache_path)
+        num_classes = int(z['num_classes'])
+        class_means = {}
+        class_inv_covs = {}
+        for c in range(num_classes):
+            key_m = f'mean_{c}'
+            key_i = f'inv_cov_{c}'
+            if key_m in z.files and key_i in z.files:
+                class_means[c] = np.asarray(z[key_m], dtype=np.float64)
+                class_inv_covs[c] = np.asarray(z[key_i], dtype=np.float64)
+        print(f'Loaded Mahalanobis stats from {cache_path} ({len(class_means)} classes)')
+        return class_means, class_inv_covs
+
+    y_flat = _as_label_vector(train_labels)
+    num_classes = int(y_flat.max()) + 1
+    hidden_layer = model.layers[layer_index]
+    forward = tf.keras.Model(
+        inputs=model.input,
+        outputs=[hidden_layer.output, model.output],
+        name='mahalanobis_hidden_forward',
+    )
+
+    by_class = {c: [] for c in range(num_classes)}
+    for start in tqdm(range(0, len(train_data), batch_size), desc=f'mahalanobis stats layer {layer_index}'):
+        end = min(start + batch_size, len(train_data))
+        bx = train_data[start:end]
+        by = y_flat[start:end]
+        bt = tf.convert_to_tensor(bx)
+        hid, raw_out = forward(bt, training=False)
+        probs = _probs_from_model_output_tensor(raw_out)
+        pred = tf.argmax(probs, axis=-1).numpy()
+        hid_flat = _hidden_to_flat_batch(hid, hidden_layer).numpy().astype(np.float64, copy=False)
+        correct = pred == by
+        for i in range(hid_flat.shape[0]):
+            if not correct[i]:
+                continue
+            c = int(by[i])
+            by_class[c].append(hid_flat[i])
+
+    class_means = {}
+    class_inv_covs = {}
+    save_dict = {'num_classes': np.int32(num_classes), 'layer_index': np.int32(layer_index)}
+    dim = None
+    for c in range(num_classes):
+        samples = by_class[c]
+        if len(samples) < 2:
+            continue
+        arr = np.stack(samples, axis=0)
+        dim = arr.shape[1]
+        mu = arr.mean(axis=0)
+        cov = np.cov(arr, rowvar=False)
+        if cov.ndim == 0:
+            cov = np.array([[float(cov)]], dtype=np.float64)
+        cov = cov + float(cov_eps) * np.eye(cov.shape[0], dtype=np.float64)
+        inv_cov = np.linalg.inv(cov)
+        class_means[c] = mu
+        class_inv_covs[c] = inv_cov
+        save_dict[f'mean_{c}'] = mu.astype(np.float32)
+        save_dict[f'inv_cov_{c}'] = inv_cov.astype(np.float32)
+
+    if dim is not None:
+        save_dict['hidden_dim'] = np.int32(dim)
+    np.savez_compressed(cache_path, **save_dict)
+    print(f'Saved Mahalanobis stats to {cache_path} ({len(class_means)} classes with stats)')
+    return class_means, class_inv_covs
+
+
 def get_risk_features(data_without_labelling,
                       model,
                       prototypes_by_layer_map,
@@ -369,6 +492,8 @@ def get_risk_features(data_without_labelling,
                       batch_size=16,
                       num_augmentations=5,
                       augment_repeats_per_transform=3,
+                      class_means=None,
+                      class_inv_covs=None,
                       ):
 
     if data_without_labelling is None:
@@ -390,12 +515,15 @@ def get_risk_features(data_without_labelling,
     entropy_list = []
     energy_list = []
     top12_margin_risk_list = []
+    deepgini_list = []
     pred_classes_list = []
     stability_flip_list = []
     stability_maxvar_list = []
     stability_mkl_list = []
+    stability_entropy_var_list = []
     dist_pred_proto_list = []
     dist_ratio_list = []
+    mahalanobis_list = []
     dist_layer_inconsistency_list = []
     non_pred_top1_class_list = []
     non_pred_top1_prob_list = []
@@ -449,6 +577,7 @@ def get_risk_features(data_without_labelling,
         probs = tf.nn.softmax(logits, axis=-1)
         prediction_entropy = -tf.reduce_sum(tf.math.xlogy(probs, probs), axis=-1)
         energy_score = -tf.math.reduce_logsumexp(logits, axis=-1)
+        deepgini = 1.0 - tf.reduce_sum(tf.square(probs), axis=-1)
 
         top2_vals, _ = tf.nn.top_k(probs, k=2)
         top12_margin_risk = 1.0 - (top2_vals[:, 0] - top2_vals[:, 1])
@@ -484,6 +613,12 @@ def get_risk_features(data_without_labelling,
             hid_flat_by_layer[int(distance_feature_layer_index)],
             pred_np,
             hidden_prototypes[int(distance_feature_layer_index)],
+        )
+        mahal = _batch_mahalanobis_dist_pred_class(
+            hid_flat_by_layer[int(distance_feature_layer_index)],
+            pred_np,
+            class_means,
+            class_inv_covs,
         )
 
         layer_consistency_flags = []
@@ -534,6 +669,8 @@ def get_risk_features(data_without_labelling,
 
         max_per_aug = tf.reduce_max(aug_probs, axis=-1)
         stability_max_prob_variance = tf.math.reduce_variance(max_per_aug, axis=1)
+        aug_entropies = -tf.reduce_sum(tf.math.xlogy(aug_probs, aug_probs), axis=-1)
+        stability_entropy_variance = tf.math.reduce_variance(aug_entropies, axis=1)
 
         p_orig = probs[:, tf.newaxis, :]
         log_p = tf.math.log(aug_probs + eps)
@@ -544,12 +681,17 @@ def get_risk_features(data_without_labelling,
         entropy_list.append(np.asarray(prediction_entropy.numpy(), dtype=np.float32).reshape(-1))
         energy_list.append(np.asarray(energy_score.numpy(), dtype=np.float32).reshape(-1))
         top12_margin_risk_list.append(np.asarray(top12_margin_risk.numpy(), dtype=np.float32).reshape(-1))
+        deepgini_list.append(np.asarray(deepgini.numpy(), dtype=np.float32).reshape(-1))
         pred_classes_list.append(np.asarray(pred_classes.numpy(), dtype=np.int64).reshape(-1))
         stability_flip_list.append(np.asarray(stability_class_change_rate.numpy(), dtype=np.float32).reshape(-1))
         stability_maxvar_list.append(np.asarray(stability_max_prob_variance.numpy(), dtype=np.float32).reshape(-1))
         stability_mkl_list.append(np.asarray(stability_mean_kl.numpy(), dtype=np.float32).reshape(-1))
+        stability_entropy_var_list.append(
+            np.asarray(stability_entropy_variance.numpy(), dtype=np.float32).reshape(-1),
+        )
         dist_pred_proto_list.append(dp.reshape(-1))
         dist_ratio_list.append(dr.reshape(-1))
+        mahalanobis_list.append(mahal.reshape(-1))
         dist_layer_inconsistency_list.append(inter_layer_inconsistency.astype(np.float32).reshape(-1))
         non_pred_top1_class_list.append(non_pred_top1_class.reshape(-1))
         non_pred_top1_prob_list.append(non_pred_top1_prob.reshape(-1))
@@ -560,12 +702,15 @@ def get_risk_features(data_without_labelling,
         'prediction_entropy': np.concatenate(entropy_list),
         'energy_score': np.concatenate(energy_list),
         'top12_margin': np.concatenate(top12_margin_risk_list),
+        'deepgini': np.concatenate(deepgini_list),
         'pred_classes': np.concatenate(pred_classes_list),
         'stability_class_change_rate': np.concatenate(stability_flip_list),
         'stability_max_prob_variance': np.concatenate(stability_maxvar_list),
         'stability_mean_kl': np.concatenate(stability_mkl_list),
+        'stability_entropy_variance': np.concatenate(stability_entropy_var_list),
         'dist_pred_class_prototype': np.concatenate(dist_pred_proto_list),
         'dist_ratio_pred_to_nearest_other_prototype': np.concatenate(dist_ratio_list),
+        'mahalanobis_dist_pred_class': np.concatenate(mahalanobis_list),
         'dist_layer_inconsistency': np.concatenate(dist_layer_inconsistency_list),
         'non_pred_top1_class': np.concatenate(non_pred_top1_class_list).astype(np.int64),
         'non_pred_top1_prob': np.concatenate(non_pred_top1_prob_list).astype(np.float32),
@@ -590,6 +735,9 @@ def build_or_load_risk_features(
     num_augmentations=5,
     augment_repeats_per_transform=3,
     force_recompute=False,
+    class_means=None,
+    class_inv_covs=None,
+    required_feature_keys=DEFAULT_RISK_FEATURE_KEYS,
 ):
 
     cache_dir = Path(cache_dir)
@@ -599,8 +747,20 @@ def build_or_load_risk_features(
     if cache_path.is_file() and not force_recompute:
         z = np.load(cache_path)
         out = {k: np.asarray(z[k]) for k in z.files}
-        print(f'Loaded risk features from {cache_path}')
-        return out
+        missing = [k for k in required_feature_keys if k not in out]
+        if not missing:
+            print(f'Loaded risk features from {cache_path}')
+            return out
+        print(
+            f'Risk feature cache missing keys {missing}; recomputing -> {cache_path}',
+        )
+
+    if 'mahalanobis_dist_pred_class' in required_feature_keys:
+        if class_means is None or class_inv_covs is None:
+            raise ValueError(
+                'class_means/class_inv_covs required for mahalanobis_dist_pred_class; '
+                'call build_or_load_mahalanobis_stats first',
+            )
 
     out = get_risk_features(
         data_without_labelling=data,
@@ -612,6 +772,8 @@ def build_or_load_risk_features(
         batch_size=batch_size,
         num_augmentations=num_augmentations,
         augment_repeats_per_transform=augment_repeats_per_transform,
+        class_means=class_means,
+        class_inv_covs=class_inv_covs,
     )
     np.savez_compressed(cache_path, **out)
     print(f'Saved risk features to {cache_path}')
@@ -783,17 +945,13 @@ def risk_scoring_function(risk_features, feature_keys=None, sample_indices=None)
         raise TypeError('risk_features is None')
 
     if feature_keys is None:
-        feature_keys = [
-            'prediction_entropy',
-            'energy_score',
-            'top12_margin',
-            'stability_class_change_rate',
-            'stability_max_prob_variance',
-            'stability_mean_kl',
-            'dist_pred_class_prototype',
-            'dist_ratio_pred_to_nearest_other_prototype',
-            'dist_layer_inconsistency',
-        ]
+        feature_keys = list(DEFAULT_RISK_FEATURE_KEYS)
+    missing = [k for k in feature_keys if k not in risk_features]
+    if missing:
+        raise ValueError(
+            f'risk_features missing keys required for scoring: {missing}. '
+            'Recompute risk feature caches (old npz may predate S*).',
+        )
     feature_keys = [k for k in feature_keys if k in risk_features]
     if len(feature_keys) == 0:
         raise ValueError('No valid feature_keys found in risk_features')
@@ -923,6 +1081,15 @@ if __name__ == "__main__":
     )
     print('prototypes_by_layer', {k: v.shape for k, v in prototypes_by_layer.items()})
 
+    class_means, class_inv_covs = build_or_load_mahalanobis_stats(
+        cnn_model,
+        train_data=x_train,
+        train_labels=y_train,
+        layer_index=distance_layer_index,
+        dataset_name=data_name,
+        batch_size=64,
+    )
+
     y_test_pred = np.argmax(cnn_model.predict(x_test, batch_size=64, verbose=0), axis=-1)
     correct_mask = (y_test_pred == y_test)
     correct_x_test = x_test[correct_mask]
@@ -940,6 +1107,8 @@ if __name__ == "__main__":
             distance_feature_layer_index=distance_layer_index,
             consistency_feature_layer_indices=consistency_layer_indices,
             batch_size=16,
+            class_means=class_means,
+            class_inv_covs=class_inv_covs,
         )
         print('correct_x_test risk features')
     else:
@@ -957,6 +1126,8 @@ if __name__ == "__main__":
             distance_feature_layer_index=distance_layer_index,
             consistency_feature_layer_indices=consistency_layer_indices,
             batch_size=16,
+            class_means=class_means,
+            class_inv_covs=class_inv_covs,
         )
         print('wrong_x_test risk features')
     else:
@@ -985,6 +1156,8 @@ if __name__ == "__main__":
             distance_feature_layer_index=distance_layer_index,
             consistency_feature_layer_indices=consistency_layer_indices,
             batch_size=16,
+            class_means=class_means,
+            class_inv_covs=class_inv_covs,
         )
         plot_groups.append((adv_prefix, risk_features))
 
@@ -1026,6 +1199,8 @@ if __name__ == "__main__":
                 distance_feature_layer_index=distance_layer_index,
                 consistency_feature_layer_indices=consistency_layer_indices,
                 batch_size=16,
+                class_means=class_means,
+                class_inv_covs=class_inv_covs,
             )
             risk_scores = risk_scoring_function(
                 combined_risk_features,

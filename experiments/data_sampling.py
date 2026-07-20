@@ -499,6 +499,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.seeds = [0, 1, 2, 3, 4]
     if int(args.confidence_bins) <= 0:
         raise ValueError('--confidence-bins must be positive')
     if not (0.0 < float(args.high_conf_threshold) < 1.0):

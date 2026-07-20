@@ -43,7 +43,6 @@ CACHE_ROOT = _EXP_DIR / 'cache_files'
 EXPLORE_SAMPLING_MODES = ('random', 'high_conf')
 EXPLORE_POOL_TYPES = ('adversarial', 'transformation')
 EXPLORE_ERROR_RATIOS = (0.10, 0.20)
-# EXPLORE_SEEDS = (0, 1, 2, 3, 4)
 EXPLORE_SEEDS = (0,)
 EXPLORE_DATASETS = ('fmnist', 'cifar10', 'svhn')
 
@@ -93,13 +92,12 @@ CONTINUOUS_RISK_FEATURE_KEYS = (
 
 # --- Feature combination search (pure risk-ranking TRC; no pseudo-labels) ---
 SEARCH_BUDGET_RATIOS = (0.01, 0.03, 0.05, 0.10)
-SEARCH_BUDGET_WEIGHTS = {0.01: 4.0, 0.03: 3.0, 0.05: 2.0, 0.10: 1.0}
-# Secondary weight on high_conf TRC; primary is random TRC.
+SEARCH_BUDGET_WEIGHTS = {0.01: 2.0, 0.03: 1.5, 0.05: 1.0, 0.10: 1.0}
 SEARCH_LAMBDA_HIGH = 0.3
-SEARCH_LAMBDA_ALL = SEARCH_LAMBDA_HIGH  # CLI/compat alias
 SEARCH_EPS_STOP = 0.002
 SEARCH_DELTA_PRUNE = 0.002
 SEARCH_DELTA_FAMILY = 0.01
+SEARCH_RANDOM_FLOOR_EPS = 0.03
 SEARCH_INIT_KEYS = ('deepgini',)
 SEARCH_DEV_SEEDS = (0, 1, 2)
 SEARCH_TEST_SEEDS = (3, 4)
@@ -1362,7 +1360,7 @@ def evaluate_feature_subset(
     *,
     budgets=SEARCH_BUDGET_RATIOS,
     budget_weights=None,
-    lambda_all=SEARCH_LAMBDA_HIGH,
+    lambda_high=SEARCH_LAMBDA_HIGH,
 ):
     """Pure risk-ranking TRC aggregation + primary score J(S).
 
@@ -1408,7 +1406,7 @@ def evaluate_feature_subset(
         w = float(budget_weights[bf])
         j_random += w * (trc_random[bf] if np.isfinite(trc_random[bf]) else 0.0)
         j_high += w * (trc_high[bf] if np.isfinite(trc_high[bf]) else 0.0)
-    j_score = j_random + float(lambda_all) * j_high
+    j_score = j_random + float(lambda_high) * j_high
 
     return {
         'feature_keys': keys,
@@ -1431,10 +1429,13 @@ def evaluate_feature_subset_global(
     *,
     budgets=SEARCH_BUDGET_RATIOS,
     budget_weights=None,
-    lambda_all=SEARCH_LAMBDA_HIGH,
+    lambda_high=SEARCH_LAMBDA_HIGH,
     dataset_order=None,
 ):
-    """Dataset-equal J_global = mean_d J_d(S) (scheme B)."""
+    """Global J from direct pool-level mean (all Dev pools concatenated).
+
+    Also returns per-dataset metrics for reporting and the random floor check.
+    """
     if budget_weights is None:
         budget_weights = SEARCH_BUDGET_WEIGHTS
     if not pools_by_dataset:
@@ -1448,6 +1449,7 @@ def evaluate_feature_subset_global(
 
     keys = list(feature_keys)
     per_dataset = {}
+    all_pools = []
     for ds in dataset_order:
         pools = pools_by_dataset[ds]
         if not pools:
@@ -1456,44 +1458,34 @@ def evaluate_feature_subset_global(
             pools, keys,
             budgets=budgets,
             budget_weights=budget_weights,
-            lambda_all=lambda_all,
+            lambda_high=lambda_high,
         )
+        all_pools.extend(pools)
 
-    j_global = float(np.mean([per_dataset[ds]['J'] for ds in dataset_order]))
-
-    def _mean_trc_maps(field):
-        out = {}
-        for b in budgets:
-            bf = float(b)
-            out[bf] = _mean_finite([per_dataset[ds][field][bf] for ds in dataset_order])
-        return out
-
-    trc_random = _mean_trc_maps('trc_random')
-    trc_high = _mean_trc_maps('trc_high_conf')
-    trc_all = _mean_trc_maps('trc_all')
-    j_random = float(np.mean([per_dataset[ds]['J_random_term'] for ds in dataset_order]))
-    j_high = float(np.mean([per_dataset[ds]['J_high_term'] for ds in dataset_order]))
-    n_pools = int(sum(per_dataset[ds]['n_pools'] for ds in dataset_order))
+    # Direct mean over all pools (no per-dataset re-weighting).
+    overall = evaluate_feature_subset(
+        all_pools, keys,
+        budgets=budgets,
+        budget_weights=budget_weights,
+        lambda_high=lambda_high,
+    )
 
     return {
         'feature_keys': keys,
-        'J': j_global,
-        'J_random_term': j_random,
-        'J_high_term': j_high,
+        'J': overall['J'],
+        'J_random_term': overall['J_random_term'],
+        'J_high_term': overall['J_high_term'],
         'J_by_dataset': {ds: per_dataset[ds]['J'] for ds in dataset_order},
-        'trc_high_conf': trc_high,
-        'trc_all': trc_all,
-        'trc_random': trc_random,
-        'n_pools': n_pools,
-        'n_high_conf': int(sum(per_dataset[ds]['n_high_conf'] for ds in dataset_order)),
-        'n_random': int(sum(per_dataset[ds]['n_random'] for ds in dataset_order)),
+        'trc_high_conf': overall['trc_high_conf'],
+        'trc_all': overall['trc_all'],
+        'trc_random': overall['trc_random'],
+        'n_pools': overall['n_pools'],
+        'n_high_conf': overall['n_high_conf'],
+        'n_random': overall['n_random'],
         'per_dataset': per_dataset,
         'datasets': list(dataset_order),
-        'per_pool': [
-            row
-            for ds in dataset_order
-            for row in per_dataset[ds].get('per_pool', [])
-        ],
+        'aggregation': 'pool_level_direct_mean',
+        'per_pool': overall.get('per_pool', []),
     }
 
 
@@ -1544,6 +1536,53 @@ def soft_family_blocks_candidate(
     return float(gain) < float(delta_family)
 
 
+def random_floor_blocks_candidate(
+    eval_new,
+    deepgini_eval,
+    *,
+    enabled,
+    budgets=SEARCH_BUDGET_RATIOS,
+    eps=SEARCH_RANDOM_FLOOR_EPS,
+):
+    """Block if random-pool mean TRC drops > eps vs DeepGini at any budget.
+
+    Supports global evals (`per_dataset` dict) and single-dataset flat evals.
+    """
+    if not enabled or deepgini_eval is None or eval_new is None:
+        return False, None
+
+    if 'per_dataset' in eval_new and 'per_dataset' in deepgini_eval:
+        pairs = []
+        for ds, ds_new in eval_new['per_dataset'].items():
+            ds_base = deepgini_eval['per_dataset'].get(ds)
+            if ds_base is not None:
+                pairs.append((ds, ds_new, ds_base))
+    else:
+        # Flat per-dataset eval result
+        if 'trc_random' not in eval_new or 'trc_random' not in deepgini_eval:
+            return False, None
+        pairs = [('local', eval_new, deepgini_eval)]
+
+    for ds, ds_new, ds_base in pairs:
+        for b in budgets:
+            bf = float(b)
+            new_v = ds_new['trc_random'][bf]
+            base_v = ds_base['trc_random'][bf]
+            if not (np.isfinite(new_v) and np.isfinite(base_v)):
+                continue
+            drop = float(base_v - new_v)
+            if drop > float(eps):
+                return True, {
+                    'dataset': ds,
+                    'budget': bf,
+                    'trc_new': float(new_v),
+                    'trc_deepgini': float(base_v),
+                    'drop': drop,
+                    'eps': float(eps),
+                }
+    return False, None
+
+
 def forward_greedy_search(
     candidates,
     *,
@@ -1552,6 +1591,9 @@ def forward_greedy_search(
     eps_stop=SEARCH_EPS_STOP,
     enable_family_soft_penalty=False,
     delta_family=SEARCH_DELTA_FAMILY,
+    enable_random_floor=False,
+    random_floor_eps=SEARCH_RANDOM_FLOOR_EPS,
+    deepgini_eval=None,
     budgets=SEARCH_BUDGET_RATIOS,
     eval_cache=None,
 ):
@@ -1590,6 +1632,7 @@ def forward_greedy_search(
         best_f = None
         best_eval = cur
         blocked = []
+        blocked_floor = []
         for f in candidates:
             if f in S:
                 continue
@@ -1601,6 +1644,15 @@ def forward_greedy_search(
                 delta_family=delta_family,
             ):
                 blocked.append(f)
+                continue
+            floor_hit, floor_info = random_floor_blocks_candidate(
+                trial, deepgini_eval,
+                enabled=enable_random_floor,
+                budgets=budgets,
+                eps=random_floor_eps,
+            )
+            if floor_hit:
+                blocked_floor.append({'feature': f, **(floor_info or {})})
                 continue
             if trial['J'] > best_eval['J']:
                 best_f = f
@@ -1616,6 +1668,7 @@ def forward_greedy_search(
                 'delta_J': 0.0,
                 'metrics': _metrics_for_json(cur, budgets=budgets),
                 'blocked': blocked,
+                'blocked_random_floor': blocked_floor,
                 'reason': 'no candidate improves J(S)',
             })
             break
@@ -1633,6 +1686,7 @@ def forward_greedy_search(
                 'best_candidate_J': best_eval['J'],
                 'metrics': _metrics_for_json(cur, budgets=budgets),
                 'blocked': blocked,
+                'blocked_random_floor': blocked_floor,
                 'reason': f'max_delta_J ({_fmt(delta)}) < eps_stop ({eps_stop})',
             })
             break
@@ -1648,6 +1702,7 @@ def forward_greedy_search(
             'delta_J': float(delta),
             'metrics': _metrics_for_json(cur, budgets=budgets),
             'blocked': blocked,
+            'blocked_random_floor': blocked_floor,
         })
 
     return {'S': list(S), 'eval': cur, 'path': path, 'eval_cache': eval_cache}
@@ -1661,6 +1716,9 @@ def backward_prune_search(
     keep_deepgini=False,
     budgets=SEARCH_BUDGET_RATIOS,
     eval_cache=None,
+    enable_random_floor=False,
+    random_floor_eps=SEARCH_RANDOM_FLOOR_EPS,
+    deepgini_eval=None,
 ):
     if eval_cache is None:
         eval_cache = {}
@@ -1692,11 +1750,21 @@ def backward_prune_search(
         best_f = None
         best_drop = None
         best_new = None
+        blocked_floor = []
         for f in S:
             if keep_deepgini and f == 'deepgini':
                 continue
             trial_keys = [k for k in S if k != f]
             trial = _cached(trial_keys)
+            floor_hit, floor_info = random_floor_blocks_candidate(
+                trial, deepgini_eval,
+                enabled=enable_random_floor,
+                budgets=budgets,
+                eps=random_floor_eps,
+            )
+            if floor_hit:
+                blocked_floor.append({'feature': f, **(floor_info or {})})
+                continue
             drop = cur['J'] - trial['J']
             if best_drop is None or drop < best_drop:
                 best_f = f
@@ -1704,6 +1772,17 @@ def backward_prune_search(
                 best_new = trial
 
         if best_f is None:
+            log.append({
+                'step': step,
+                'action': 'stop',
+                'removed': None,
+                'S': list(S),
+                'J': cur['J'],
+                'drop': None,
+                'metrics': _metrics_for_json(cur, budgets=budgets),
+                'blocked_random_floor': blocked_floor,
+                'reason': 'no removable feature without violating random floor',
+            })
             break
         if best_drop < float(delta_prune):
             S = [k for k in S if k != best_f]
@@ -1716,6 +1795,7 @@ def backward_prune_search(
                 'J': cur['J'],
                 'drop': best_drop,
                 'metrics': _metrics_for_json(cur, budgets=budgets),
+                'blocked_random_floor': blocked_floor,
             })
         else:
             log.append({
@@ -1727,6 +1807,7 @@ def backward_prune_search(
                 'drop': best_drop,
                 'candidate_remove': best_f,
                 'metrics': _metrics_for_json(cur, budgets=budgets),
+                'blocked_random_floor': blocked_floor,
                 'reason': f'min_drop ({_fmt(best_drop)}) >= delta_prune ({delta_prune})',
             })
             break
@@ -1986,7 +2067,7 @@ def _run_feature_search_one_dataset(
     sampling_modes,
     out_dir,
     *,
-    lambda_all,
+    lambda_high,
     eps_stop,
     delta_prune,
     keep_deepgini,
@@ -1994,6 +2075,8 @@ def _run_feature_search_one_dataset(
     delta_family,
     budgets,
     budget_weights,
+    enable_random_floor=True,
+    random_floor_eps=SEARCH_RANDOM_FLOOR_EPS,
 ):
     """Run greedy feature search on a single dataset; write artifacts under out_dir."""
     out_dir = Path(out_dir)
@@ -2016,7 +2099,8 @@ def _run_feature_search_one_dataset(
 
     print(
         f'[search:{dataset_name}] Dev pools={len(dev_pools)}, '
-        f'Test pools={len(test_pools)} ({seed_note})',
+        f'Test pools={len(test_pools)} ({seed_note}); '
+        f'random_floor={"on" if enable_random_floor else "off"}, eps={random_floor_eps}',
     )
 
     config = {
@@ -2025,13 +2109,15 @@ def _run_feature_search_one_dataset(
         'timestamp_utc': datetime.now(timezone.utc).isoformat(),
         'budgets': [float(b) for b in budgets],
         'budget_weights': {_budget_key(b): float(budget_weights[float(b)]) for b in budgets},
-        'lambda_all': float(lambda_all),
+        'lambda_high': float(lambda_high),
         'eps_stop': float(eps_stop),
         'delta_prune': float(delta_prune),
         'init': list(SEARCH_INIT_KEYS),
         'keep_deepgini': bool(keep_deepgini),
         'enable_family_soft_penalty': bool(enable_family_soft_penalty),
         'delta_family': float(delta_family),
+        'enable_random_floor': bool(enable_random_floor),
+        'random_floor_eps': float(random_floor_eps),
         'candidates': candidates,
         'pool_types': list(pool_types),
         'error_ratios': [float(x) for x in error_ratios],
@@ -2043,8 +2129,8 @@ def _run_feature_search_one_dataset(
         'n_dev_pools': len(dev_pools),
         'n_test_pools': len(test_pools),
         'objective': (
-            'J(S)=sum_b w_b*mean_TRC_random(S,b) + lambda*sum_b w_b*mean_TRC_high(S,b); '
-            'primary=random, secondary=high_conf; pure risk-ranking; per dataset'
+            'J(S)=1*sum_b w_b*mean_TRC_random + lambda*sum_b w_b*mean_TRC_high; '
+            'random_floor vs deepgini (optional); per dataset'
         ),
     }
     (out_dir / 'search_config.json').write_text(
@@ -2059,7 +2145,7 @@ def _run_feature_search_one_dataset(
             dev_pools, list(keys),
             budgets=budgets,
             budget_weights=budget_weights,
-            lambda_all=lambda_all,
+            lambda_high=lambda_high,
         )
 
     single_rows = []
@@ -2076,6 +2162,9 @@ def _run_feature_search_one_dataset(
         })
     _write_single_feature_trc_outputs(out_dir, single_rows, budgets=budgets)
 
+    gini_eval = _eval_local(list(SEARCH_INIT_KEYS))
+    eval_cache[frozenset(SEARCH_INIT_KEYS)] = gini_eval
+
     print(f'[search:{dataset_name}] Step B: forward greedy')
     fwd = forward_greedy_search(
         candidates,
@@ -2084,6 +2173,9 @@ def _run_feature_search_one_dataset(
         eps_stop=eps_stop,
         enable_family_soft_penalty=enable_family_soft_penalty,
         delta_family=delta_family,
+        enable_random_floor=enable_random_floor,
+        random_floor_eps=random_floor_eps,
+        deepgini_eval=gini_eval,
         budgets=budgets,
         eval_cache=eval_cache,
     )
@@ -2101,12 +2193,14 @@ def _run_feature_search_one_dataset(
         keep_deepgini=keep_deepgini,
         budgets=budgets,
         eval_cache=fwd['eval_cache'],
+        enable_random_floor=enable_random_floor,
+        random_floor_eps=random_floor_eps,
+        deepgini_eval=gini_eval,
     )
     _write_prune_log_outputs(out_dir, prn['log'], budgets=budgets)
 
     star_keys = prn['S']
     star_eval = prn['eval']
-    gini_eval = _eval_local(list(SEARCH_INIT_KEYS))
     _write_comparison_md(out_dir, star_eval, gini_eval, budgets=budgets)
 
     test_metrics = None
@@ -2117,7 +2211,7 @@ def _run_feature_search_one_dataset(
                 test_pools, star_keys,
                 budgets=budgets,
                 budget_weights=budget_weights,
-                lambda_all=lambda_all,
+                lambda_high=lambda_high,
             ),
             budgets=budgets,
         )
@@ -2126,7 +2220,7 @@ def _run_feature_search_one_dataset(
                 test_pools, list(SEARCH_INIT_KEYS),
                 budgets=budgets,
                 budget_weights=budget_weights,
-                lambda_all=lambda_all,
+                lambda_high=lambda_high,
             ),
             budgets=budgets,
         )
@@ -2145,10 +2239,11 @@ def _run_feature_search_one_dataset(
             'secondary_term': 'high_conf_trc',
             'budgets': [float(b) for b in budgets],
             'budget_weights': {_budget_key(b): float(budget_weights[float(b)]) for b in budgets},
-            'lambda_high': float(lambda_all),
-            'lambda_all': float(lambda_all),  # alias for CLI --search-lambda
+            'lambda_high': float(lambda_high),
             'eps_stop': float(eps_stop),
             'delta_prune': float(delta_prune),
+            'enable_random_floor': bool(enable_random_floor),
+            'random_floor_eps': float(random_floor_eps),
             'init': list(SEARCH_INIT_KEYS),
             'keep_deepgini': bool(keep_deepgini),
             'enable_family_soft_penalty': bool(enable_family_soft_penalty),
@@ -2398,7 +2493,8 @@ def _write_global_feature_exploration_summary(
         f'(DeepGini {_fmt(global_payload["reference_deepgini"]["J"])})',
         '',
         'Primary = random TRC; secondary = $\\lambda$ · high_conf. '
-        '$J_{\\mathrm{global}}=\\mathrm{mean}_d J_d$ (dataset-equal).',
+        '$J_{\\mathrm{global}}$ = direct mean over all Dev pools '
+        '(no per-dataset re-weighting).',
         '',
         '## Per-dataset TRC under S_global',
         '',
@@ -2453,7 +2549,7 @@ def _run_feature_search_global(
     seed_note,
     sampling_modes,
     *,
-    lambda_all,
+    lambda_high,
     eps_stop,
     delta_prune,
     keep_deepgini,
@@ -2463,8 +2559,10 @@ def _run_feature_search_global(
     budget_weights,
     summary_path=None,
     per_dataset_adaptive=None,
+    enable_random_floor=True,
+    random_floor_eps=SEARCH_RANDOM_FLOOR_EPS,
 ):
-    """Optimize one S*_global via dataset-equal J_global; write global_* artifacts."""
+    """Optimize S*_global via pool-level J + optional random floor; write global_* artifacts."""
     feature_cache_dir = Path(feature_cache_dir)
     dataset_list = list(datasets)
     candidates = list(CONTINUOUS_RISK_FEATURE_KEYS)
@@ -2488,25 +2586,29 @@ def _run_feature_search_global(
 
     config = {
         'scope': 'global',
-        'aggregation': 'dataset_equal_mean_J_d',
+        'aggregation': 'pool_level_direct_mean',
         'timestamp_utc': datetime.now(timezone.utc).isoformat(),
         'datasets': dataset_list,
         'budgets': [float(b) for b in budgets],
         'budget_weights': {_budget_key(b): float(budget_weights[float(b)]) for b in budgets},
-        'lambda_high': float(lambda_all),
+        'lambda_high': float(lambda_high),
         'eps_stop': float(eps_stop),
         'delta_prune': float(delta_prune),
         'init': list(SEARCH_INIT_KEYS),
         'keep_deepgini': bool(keep_deepgini),
         'enable_family_soft_penalty': bool(enable_family_soft_penalty),
         'delta_family': float(delta_family),
+        'enable_random_floor': bool(enable_random_floor),
+        'random_floor_eps': float(random_floor_eps),
         'candidates': candidates,
         'dev_seeds': list(dev_seeds),
         'test_seeds': list(test_seeds),
         'seed_note': seed_note,
         'objective': (
-            'J_global=mean_d J_d; '
-            'J_d=sum_b w_b*TRC_rand + lambda*sum_b w_b*TRC_high'
+            'J_global=direct mean over all Dev pools of '
+            '(sum_b w_b*TRC_rand + lambda*sum_b w_b*TRC_high); '
+            'forward skips adds that drop any dataset random mean TRC '
+            f'> {float(random_floor_eps):.2f} vs deepgini at any budget'
         ),
     }
     (feature_cache_dir / 'global_search_config.json').write_text(
@@ -2518,7 +2620,7 @@ def _run_feature_search_global(
             pools_by_dataset, list(keys),
             budgets=budgets,
             budget_weights=budget_weights,
-            lambda_all=lambda_all,
+            lambda_high=lambda_high,
             dataset_order=dataset_list,
         )
 
@@ -2541,7 +2643,14 @@ def _run_feature_search_global(
         feature_cache_dir, single_rows, budgets=budgets, name_prefix='global_',
     )
 
-    print('[search:global] Step B: forward greedy')
+    gini_eval = _eval_global(list(SEARCH_INIT_KEYS))
+    eval_cache[frozenset(SEARCH_INIT_KEYS)] = gini_eval
+
+    print(
+        f'[search:global] Step B: forward greedy '
+        f'(random_floor={"on" if enable_random_floor else "off"}, '
+        f'eps={random_floor_eps})',
+    )
     fwd = forward_greedy_search(
         candidates,
         eval_fn=_eval_global,
@@ -2549,6 +2658,9 @@ def _run_feature_search_global(
         eps_stop=eps_stop,
         enable_family_soft_penalty=enable_family_soft_penalty,
         delta_family=delta_family,
+        enable_random_floor=enable_random_floor,
+        random_floor_eps=random_floor_eps,
+        deepgini_eval=gini_eval,
         budgets=budgets,
         eval_cache=eval_cache,
     )
@@ -2565,6 +2677,9 @@ def _run_feature_search_global(
         keep_deepgini=keep_deepgini,
         budgets=budgets,
         eval_cache=fwd['eval_cache'],
+        enable_random_floor=enable_random_floor,
+        random_floor_eps=random_floor_eps,
+        deepgini_eval=gini_eval,
     )
     _write_prune_log_outputs(
         feature_cache_dir, prn['log'], budgets=budgets, name_prefix='global_',
@@ -2572,7 +2687,6 @@ def _run_feature_search_global(
 
     star_keys = prn['S']
     star_eval = prn['eval']
-    gini_eval = _eval_global(list(SEARCH_INIT_KEYS))
 
     artifacts = {
         'top_level': str(feature_cache_dir),
@@ -2623,20 +2737,22 @@ def _run_feature_search_global(
         'scope': 'global',
         'feature_keys': star_keys,
         'selection_criterion': {
-            'name': 'J_global_dataset_equal',
+            'name': 'J_global_pool_direct_mean',
             'search': 'argmax J_global via forward_greedy + backward_prune',
             'formula': (
-                'J_global=mean_d J_d; '
-                'J_d=sum_b w_b*mean_TRC_random + lambda*sum_b w_b*mean_TRC_high'
+                'J_global=pool_level_mean(sum_b w_b*TRC_rand + lambda*sum_b w_b*TRC_high); '
+                'random_floor: skip add if any dataset random mean TRC drops > eps vs deepgini'
             ),
             'primary_term': 'random_trc',
             'secondary_term': 'high_conf_trc',
-            'aggregation': 'dataset_equal_mean',
+            'aggregation': 'pool_level_direct_mean',
             'budgets': [float(b) for b in budgets],
             'budget_weights': {_budget_key(b): float(budget_weights[float(b)]) for b in budgets},
-            'lambda_high': float(lambda_all),
+            'lambda_high': float(lambda_high),
             'eps_stop': float(eps_stop),
             'delta_prune': float(delta_prune),
+            'enable_random_floor': bool(enable_random_floor),
+            'random_floor_eps': float(random_floor_eps),
             'init': list(SEARCH_INIT_KEYS),
             'keep_deepgini': bool(keep_deepgini),
             'enable_family_soft_penalty': bool(enable_family_soft_penalty),
@@ -2702,12 +2818,14 @@ def run_feature_search(
     summary_path=None,
     *,
     search_scope='global',
-    lambda_all=SEARCH_LAMBDA_ALL,
+    lambda_high=SEARCH_LAMBDA_HIGH,
     eps_stop=SEARCH_EPS_STOP,
     delta_prune=SEARCH_DELTA_PRUNE,
     keep_deepgini=False,
     enable_family_soft_penalty=False,
     delta_family=SEARCH_DELTA_FAMILY,
+    enable_random_floor=True,
+    random_floor_eps=SEARCH_RANDOM_FLOOR_EPS,
     budgets=SEARCH_BUDGET_RATIOS,
     budget_weights=None,
 ):
@@ -2715,7 +2833,7 @@ def run_feature_search(
     Feature-subset search.
 
     search_scope:
-      - global: dataset-equal J_global → cache_files/global_* + per-ds global_* eval
+      - global: pool-level J_global + random floor → cache_files/global_*
       - per_dataset: each dataset → cache_files/{ds}/feature_search/ + feature_exploration_summary
       - both: global then per_dataset (rewrite global summary with adaptive contrast)
     """
@@ -2730,7 +2848,7 @@ def run_feature_search(
     result = {'search_scope': search_scope}
 
     common_kw = dict(
-        lambda_all=lambda_all,
+        lambda_high=lambda_high,
         eps_stop=eps_stop,
         delta_prune=delta_prune,
         keep_deepgini=keep_deepgini,
@@ -2738,6 +2856,8 @@ def run_feature_search(
         delta_family=delta_family,
         budgets=budgets,
         budget_weights=budget_weights,
+        enable_random_floor=enable_random_floor,
+        random_floor_eps=random_floor_eps,
     )
 
     global_payload = None
@@ -2884,7 +3004,12 @@ def parse_args():
             '(global_feature_exploration_summary.md or feature_exploration_summary.md)'
         ),
     )
-    parser.add_argument('--search-lambda', type=float, default=SEARCH_LAMBDA_ALL)
+    parser.add_argument(
+        '--search-lambda-high',
+        type=float,
+        default=SEARCH_LAMBDA_HIGH,
+        help='weight on high_conf TRC secondary term in J',
+    )
     parser.add_argument('--eps-stop', type=float, default=SEARCH_EPS_STOP)
     parser.add_argument('--delta-prune', type=float, default=SEARCH_DELTA_PRUNE)
     parser.add_argument(
@@ -2898,11 +3023,25 @@ def parse_args():
         help='optional same-family soft filter during forward greedy',
     )
     parser.add_argument('--delta-family', type=float, default=SEARCH_DELTA_FAMILY)
+    parser.add_argument(
+        '--disable-random-floor',
+        action='store_true',
+        help='disable global random TRC floor vs DeepGini during forward greedy',
+    )
+    parser.add_argument(
+        '--random-floor-eps',
+        type=float,
+        default=SEARCH_RANDOM_FLOOR_EPS,
+        help='max allowed drop of any dataset random mean TRC vs DeepGini (default: 0.03)',
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    args.seeds = (0, 1, 2, 3, 4)
+    args.phase = 'compute'
+    args.search_scope = 'both'
     if args.phase in ('compute', 'all'):
         run_feature_compute(
             sampled_root=args.sampled_root,
@@ -2951,12 +3090,14 @@ def main():
             sampling_modes=args.sampling_modes,
             summary_path=args.summary_path,
             search_scope=args.search_scope,
-            lambda_all=args.search_lambda,
+            lambda_high=args.search_lambda_high,
             eps_stop=args.eps_stop,
             delta_prune=args.delta_prune,
             keep_deepgini=args.keep_deepgini,
             enable_family_soft_penalty=args.enable_family_soft_penalty,
             delta_family=args.delta_family,
+            enable_random_floor=not args.disable_random_floor,
+            random_floor_eps=args.random_floor_eps,
         )
 
 
