@@ -21,12 +21,15 @@ tf.get_logger().setLevel('ERROR')
 logging.getLogger().setLevel(logging.WARNING)
 
 
-from training_models.load_data import load_cifar10, load_fmnist
+from training_models.load_data import load_cifar10, load_fmnist, load_svhn
 from pseudo_labelling import build_or_load_snorkel_result_from_risk_features
 from risk_scoring import (
+    DEFAULT_RISK_FEATURE_KEYS,
     build_or_load_class_prototypes_dict,
+    build_or_load_mahalanobis_stats,
     build_or_load_risk_features,
     risk_scoring_function,
+    required_risk_feature_keys,
 )
 from selection_method import (
     build_or_load_greedy_run,
@@ -71,14 +74,14 @@ DATASET_CONFIG = {
         'distance_layer_index': -5,
         'consistency_layer_indices': [-19, -15, -11, -5],
     },
+    'svhn': {
+        'loader': load_svhn,
+        'model_path': _REPO_ROOT / 'models' / 'resnet18_svhn' / 'tf_model.h5',
+        'assist_model_path': _REPO_ROOT / 'models' / 'vgg19_svhn' / 'tf_model.h5',
+        'distance_layer_index': -4,
+        'consistency_layer_indices': [-40, -23, -14, -4],
+    },
 }
-
-
-def _as_label_vector(arr):
-    out = np.asarray(arr)
-    if out.ndim > 1:
-        out = np.argmax(out, axis=-1)
-    return out.reshape(-1).astype(np.int64, copy=False)
 
 
 def build_flat_pool_storage_and_attributes(
@@ -158,8 +161,23 @@ def load_sampled_pool(sampled_root, dataset_name, pool_type, error_ratio, seed, 
 
 
 def pool_cache_tag(dataset_name, pool_type, error_ratio, seed, sampling_mode='random'):
+    """RQ1-specific tag for snorkel/greedy caches."""
     ratio_pct = int(round(float(error_ratio) * 100))
     return f'rq1_{dataset_name}_{pool_type}_r{ratio_pct:02d}_s{int(seed)}_{sampling_mode}'
+
+
+def explore_feature_cache_name(dataset_name, pool_type, error_ratio, seed, sampling_mode='random'):
+    """Shared explore-phase feature cache (Ablation_risk_feature_exploration)."""
+    ratio_pct = int(round(float(error_ratio) * 100))
+    tag = f'explore_{dataset_name}_{pool_type}_r{ratio_pct:02d}_s{int(seed)}_{sampling_mode}'
+    return f'all_risk_features_{tag}.npz'
+
+
+def _as_label_vector(arr):
+    out = np.asarray(arr)
+    if out.ndim > 1:
+        out = np.argmax(out, axis=-1)
+    return out.reshape(-1).astype(np.int64, copy=False)
 
 
 def evaluate_sampled_pool(
@@ -173,6 +191,8 @@ def evaluate_sampled_pool(
     cnn_model,
     assist_model,
     prototypes_by_layer,
+    class_means,
+    class_inv_covs,
     dataset_cfg,
     cache_dir,
     greedy_cfg,
@@ -183,10 +203,14 @@ def evaluate_sampled_pool(
     pool_data = pool['data']
     n_pool = len(pool_data)
     tag = pool_cache_tag(dataset_name, pool_type, error_ratio, seed, sampling_mode)
+    feature_cache_name = explore_feature_cache_name(
+        dataset_name, pool_type, error_ratio, seed, sampling_mode,
+    )
+    required_keys = required_risk_feature_keys(dataset_cfg['consistency_layer_indices'])
 
     risk_features = build_or_load_risk_features(
         cache_dir=cache_dir,
-        cache_name=f'risk_features_{tag}.npz',
+        cache_name=feature_cache_name,
         data=pool_data,
         model=cnn_model,
         prototypes_by_layer_map=prototypes_by_layer,
@@ -194,9 +218,14 @@ def evaluate_sampled_pool(
         consistency_feature_layer_indices=dataset_cfg['consistency_layer_indices'],
         batch_size=16,
         force_recompute=force_recompute,
+        class_means=class_means,
+        class_inv_covs=class_inv_covs,
+        required_feature_keys=required_keys,
+        write_cache=False,
     )
     risk_scores = risk_scoring_function(
         risk_features,
+        feature_keys=list(DEFAULT_RISK_FEATURE_KEYS),
         sample_indices=np.arange(n_pool, dtype=np.int64),
     )
 
@@ -314,10 +343,15 @@ def format_results_table(summary_rows, seeds):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='RQ1 greedy TRC evaluation on sampled pools.')
-    parser.add_argument('--datasets', nargs='+', default=['fmnist', 'cifar10'], choices=sorted(DATASET_CONFIG))
+    parser.add_argument(
+        '--datasets',
+        nargs='+',
+        default=list(DATASET_CONFIG),
+        choices=sorted(DATASET_CONFIG),
+    )
     parser.add_argument('--pool-types', nargs='+', default=RQ1_POOL_TYPES, choices=RQ1_POOL_TYPES)
     parser.add_argument('--error-ratios', nargs='+', type=float, default=RQ1_ERROR_RATIOS)
-    parser.add_argument('--seeds', nargs='+', type=int, default=[0])
+    parser.add_argument('--seeds', nargs='+', type=int, default=list(RQ1_SEEDS))
     parser.add_argument(
         '--error-sampling-mode',
         default='random',
@@ -328,7 +362,7 @@ def parse_args():
     parser.add_argument('--output-dir', default=str(_EXP_DIR / 'results' / 'rq1'))
     parser.add_argument('--greedy-alpha', type=float, default=0.5)
     parser.add_argument('--greedy-phi-mode', default='sqrt')
-    parser.add_argument('--greedy-risk-gate-power', type=float, default=3.0)
+    parser.add_argument('--greedy-risk-gate-power', type=float, default=4.0)
     parser.add_argument('--force-recompute', action='store_true')
     return parser.parse_args()
 
@@ -373,6 +407,14 @@ def main():
             dataset_name=dataset_name,
             batch_size=64,
         )
+        class_means, class_inv_covs = build_or_load_mahalanobis_stats(
+            cnn_model,
+            train_data=x_train,
+            train_labels=y_train,
+            layer_index=cfg['distance_layer_index'],
+            dataset_name=dataset_name,
+            batch_size=64,
+        )
 
         for pool_type in args.pool_types:
             for error_ratio in args.error_ratios:
@@ -400,6 +442,8 @@ def main():
                         cnn_model=cnn_model,
                         assist_model=assist_model,
                         prototypes_by_layer=prototypes_by_layer,
+                        class_means=class_means,
+                        class_inv_covs=class_inv_covs,
                         dataset_cfg=cfg,
                         cache_dir=cache_dir,
                         greedy_cfg=greedy_cfg,

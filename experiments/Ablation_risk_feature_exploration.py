@@ -29,6 +29,7 @@ logging.getLogger().setLevel(logging.WARNING)
 
 from training_models.load_data import load_cifar10, load_fmnist, load_svhn
 from risk_scoring import (
+    _batch_nearest_non_pred_class_features,
     _batch_pred_class_is_min_distance,
     _hidden_to_flat_batch,
     build_or_load_class_prototypes_dict,
@@ -88,6 +89,14 @@ CONTINUOUS_RISK_FEATURE_KEYS = (
     'dist_layer_inconsistency',
     'cosine_dist_pred_proto',
     'mahalanobis_dist_pred_class',
+)
+
+# Extra fields needed by Snorkel LFs (and RQ1)
+SNORKEL_AUX_FEATURE_KEYS = (
+    'non_pred_top1_class',
+    'non_pred_top1_prob',
+    'non_pred_top2_prob',
+    'aug_non_pred_mode_class',
 )
 
 # --- Feature combination search (pure risk-ranking TRC; no pseudo-labels) ---
@@ -349,6 +358,11 @@ def get_all_risk_features(
 
     collectors = {k: [] for k in CONTINUOUS_RISK_FEATURE_KEYS}
     pred_classes_list = []
+    non_pred_top1_class_list = []
+    non_pred_top1_prob_list = []
+    non_pred_top2_prob_list = []
+    aug_non_pred_mode_class_list = []
+    nearest_non_pred_class_by_layer = {idx: [] for idx in consistency_feature_layer_indices}
 
     eps = tf.constant(1e-8, tf.float32)
     n_aug = int(num_augmentations) * augment_repeats_per_transform
@@ -364,11 +378,25 @@ def get_all_risk_features(
 
         pred_classes = tf.argmax(probs, axis=-1)
         pred_np = pred_classes.numpy()
+        num_classes = int(probs.shape[-1])
 
         logit_l2 = tf.sqrt(tf.reduce_sum(tf.square(logits), axis=-1))
         max_prob = tf.reduce_max(probs, axis=-1)
         top2_vals, _ = tf.nn.top_k(probs, k=2)
         deepgini = 1.0 - tf.reduce_sum(tf.square(probs), axis=-1)
+
+        probs_np = probs.numpy()
+        sample_idx = np.arange(probs_np.shape[0], dtype=np.int64)
+        probs_non_pred = probs_np.copy()
+        probs_non_pred[sample_idx, pred_np] = -np.inf
+        non_pred_order = np.argsort(probs_non_pred, axis=1)
+        non_pred_top1_class = non_pred_order[:, -1].astype(np.int64)
+        non_pred_top1_prob = probs_np[sample_idx, non_pred_top1_class].astype(np.float32)
+        if num_classes >= 3:
+            non_pred_top2_class = non_pred_order[:, -2].astype(np.int64)
+            non_pred_top2_prob = probs_np[sample_idx, non_pred_top2_class].astype(np.float32)
+        else:
+            non_pred_top2_prob = np.full(probs_np.shape[0], np.nan, dtype=np.float32)
 
         hid_flat_by_layer = {}
         for idx, hid in zip(hidden_layer_indices, hid_outs):
@@ -391,6 +419,12 @@ def get_all_risk_features(
                     hidden_prototypes[idx],
                 ),
             )
+            near_cls = _batch_nearest_non_pred_class_features(
+                hid_flat_by_layer[idx],
+                pred_np,
+                hidden_prototypes[idx],
+            )
+            nearest_non_pred_class_by_layer[idx].append(near_cls.reshape(-1))
         layer_flags = np.stack(layer_flags, axis=1)
         dist_layer_inconsistency = 1.0 - np.mean(layer_flags, axis=1)
 
@@ -420,6 +454,19 @@ def get_all_risk_features(
         pred_orig = tf.expand_dims(pred_classes, 1)
         stability_flip = tf.reduce_mean(tf.cast(tf.not_equal(pred_orig, aug_preds), tf.float32), axis=1)
         stability_maxvar = tf.math.reduce_variance(tf.reduce_max(aug_probs, axis=-1), axis=1)
+
+        aug_preds_np = aug_preds.numpy().astype(np.int64)
+        pred_col = pred_np[:, None]
+        non_pred_mask = (aug_preds_np != pred_col)
+        counts_all = np.zeros((aug_preds_np.shape[0], num_classes), dtype=np.int64)
+        for c in range(num_classes):
+            counts_all[:, c] = np.sum((aug_preds_np == c) & non_pred_mask, axis=1)
+        aug_non_pred_mode_class = np.argmax(counts_all, axis=1).astype(np.int64)
+        max_counts = np.max(counts_all, axis=1, keepdims=True)
+        tie_for_top = np.sum(counts_all == max_counts, axis=1) > 1
+        aug_non_pred_mode_class[tie_for_top] = -1
+        no_non_pred_vote = np.sum(non_pred_mask, axis=1) == 0
+        aug_non_pred_mode_class[no_non_pred_vote] = -1
 
         p_orig = probs[:, tf.newaxis, :]
         log_p = tf.math.log(aug_probs + eps)
@@ -457,10 +504,33 @@ def get_all_risk_features(
         for key in CONTINUOUS_RISK_FEATURE_KEYS:
             collectors[key].append(batch_out[key])
         pred_classes_list.append(pred_np.reshape(-1))
+        non_pred_top1_class_list.append(non_pred_top1_class.reshape(-1))
+        non_pred_top1_prob_list.append(non_pred_top1_prob.reshape(-1))
+        non_pred_top2_prob_list.append(non_pred_top2_prob.reshape(-1))
+        aug_non_pred_mode_class_list.append(aug_non_pred_mode_class.reshape(-1))
 
     out = {k: np.concatenate(collectors[k]) for k in CONTINUOUS_RISK_FEATURE_KEYS}
     out['pred_classes'] = np.concatenate(pred_classes_list).astype(np.int64)
+    out['non_pred_top1_class'] = np.concatenate(non_pred_top1_class_list).astype(np.int64)
+    out['non_pred_top1_prob'] = np.concatenate(non_pred_top1_prob_list).astype(np.float32)
+    out['non_pred_top2_prob'] = np.concatenate(non_pred_top2_prob_list).astype(np.float32)
+    out['aug_non_pred_mode_class'] = np.concatenate(aug_non_pred_mode_class_list).astype(np.int64)
+    for idx in consistency_feature_layer_indices:
+        out[f'nearest_non_pred_class_layer_{idx}'] = np.concatenate(
+            nearest_non_pred_class_by_layer[idx],
+        ).astype(np.int64)
     return out
+
+
+def _explore_cache_required_keys(consistency_feature_layer_indices):
+    keys = (
+        list(CONTINUOUS_RISK_FEATURE_KEYS)
+        + ['pred_classes']
+        + list(SNORKEL_AUX_FEATURE_KEYS)
+    )
+    for idx in consistency_feature_layer_indices:
+        keys.append(f'nearest_non_pred_class_layer_{int(idx)}')
+    return keys
 
 
 def build_or_load_all_risk_features(
@@ -482,12 +552,18 @@ def build_or_load_all_risk_features(
     cache_dir = Path(cache_root)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / cache_name
+    required = _explore_cache_required_keys(consistency_feature_layer_indices)
 
     if cache_path.is_file() and not force_recompute:
         z = np.load(cache_path)
         out = {k: np.asarray(z[k]) for k in z.files}
-        print(f'Loaded all risk features from {cache_path}')
-        return out
+        missing = [k for k in required if k not in out]
+        if not missing:
+            print(f'Loaded all risk features from {cache_path}')
+            return out
+        print(
+            f'Risk feature cache missing keys {missing}; recomputing -> {cache_path}',
+        )
 
     out = get_all_risk_features(
         data_without_labelling=data,
@@ -3039,7 +3115,8 @@ def parse_args():
 
 def main():
     args = parse_args()
-    args.seeds = (0, 1, 2, 3, 4)
+    # args.seeds = (0, 1, 2, 3, 4)
+    args.seeds = (0,)
     args.phase = 'compute'
     args.search_scope = 'both'
     if args.phase in ('compute', 'all'):

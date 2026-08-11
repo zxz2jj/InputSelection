@@ -1,10 +1,10 @@
 import os
 import tensorflow
-from load_data import load_mnist, load_fmnist, load_cifar10, load_svhn
+from load_data import load_fmnist, load_cifar10, load_svhn
 from model_lenet import LeNetModel
 from model_vgg import VGGModel
-from model_resnet18 import ResNet18Model
-# from model_vgg import VGGModel
+# from model_resnet18 import ResNet18Model
+from model_vgg import VGGModel
 # from model_resnet18 import ResNet18Model
 from global_config import num_of_labels
 
@@ -19,16 +19,11 @@ def train_model(id_dataset, model_save_path, model_name):
         x_train, y_train, x_test, y_test = load_cifar10()
         model = ResNet18Model(train_class_number=num_of_labels[id_dataset], train_data=x_train, train_label=y_train,
                          test_data=x_test, test_label=y_test, model_save_path=model_save_path, model_name=model_name)
-    # elif id_dataset == 'svhn':
-    #     x_train, y_train, x_test, y_test = load_svhn()
-    #     model = ResNet18Model(train_class_number=num_of_labels[id_dataset], train_data=x_train, train_label=y_train,
-    #                           test_data=x_test, test_label=y_test,
-    #                           model_save_path=model_save_path, model_name=model_name)
-    # elif id_dataset == 'cifar100':
-    #     x_train, y_train, x_test, y_test = load_cifar100()
-    #     model = ResNet18Model(train_class_number=num_of_labels[id_dataset], train_data=x_train, train_label=y_train,
-    #                           test_data=x_test, test_label=y_test,
-    #                           model_save_path=model_save_path, model_name=model_name)
+    elif id_dataset == 'svhn':
+        x_train, y_train, x_test, y_test = load_svhn()
+        model = VGGModel(train_class_number=num_of_labels[id_dataset], train_data=x_train, train_label=y_train,
+                        test_data=x_test, test_label=y_test,
+                        model_save_path=model_save_path, model_name=model_name)
     else:
         model = None
 
@@ -47,12 +42,12 @@ if __name__ == "__main__":
     # save_path = '../models/resnet18_fmnist/'
     # save_name = f'tf_model.h5'
 
-    dataset = 'cifar10'
-    save_path = '../models/resnet18_cifar10/'
-    save_name = f'tf_model.h5'
-
-    # dataset = 'svhn'
-    # save_path = '../models/resnet18_svhn/'
+    # dataset = 'cifar10'
+    # save_path = '../models/resnet18_cifar10/'
     # save_name = f'tf_model.h5'
+
+    dataset = 'svhn'
+    save_path = '../models/vgg19_svhn/'
+    save_name = f'tf_model.h5'
 
     train_model(id_dataset=dataset, model_save_path=save_path, model_name=save_name)

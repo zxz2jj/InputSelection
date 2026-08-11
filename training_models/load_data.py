@@ -70,7 +70,7 @@ data_augmentation = preprocessing.image.ImageDataGenerator(
 #     return x_train, y_train_one_hot, \
 #         x_test, y_test_one_hot
 #
-#
+
 def load_fmnist():
     (x_train, y_train), (x_test, y_test) = datasets.fashion_mnist.load_data()
     x_train = x_train.astype('float32') / 255.

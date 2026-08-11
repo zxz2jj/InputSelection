@@ -15,6 +15,31 @@ from tqdm import tqdm
 from training_models.load_data import load_fmnist, load_cifar10
 
 
+# Global S* from feature exploration (rank-average fusion keys).
+DEFAULT_RISK_FEATURE_KEYS = (
+    'deepgini',
+    'stability_class_change_rate',
+    'mahalanobis_dist_pred_class',
+    'stability_entropy_variance',
+)
+
+# Extra arrays needed by Snorkel LFs (not used in risk score fusion).
+SNORKEL_AUX_FEATURE_KEYS = (
+    'pred_classes',
+    'non_pred_top1_class',
+    'non_pred_top1_prob',
+    'non_pred_top2_prob',
+    'aug_non_pred_mode_class',
+)
+
+
+def required_risk_feature_keys(consistency_feature_layer_indices):
+    keys = list(DEFAULT_RISK_FEATURE_KEYS) + list(SNORKEL_AUX_FEATURE_KEYS)
+    for idx in consistency_feature_layer_indices:
+        keys.append(f'nearest_non_pred_class_layer_{int(idx)}')
+    return keys
+
+
 def _keras_preprocessing_layer(class_name, *args, **kwargs):
     if hasattr(tf.keras.layers, class_name):
         cls = getattr(tf.keras.layers, class_name)
@@ -358,15 +383,6 @@ def image_data_augmentation(x, transform_id=None):
         return _blur_augment(x)
 
     raise ValueError(f'unknown transform_id={transform_id!r} (expected 1–5 or None)')
-
-
-# Global S* from experiments/Ablation_risk_feature_exploration.py (pool-level J_global).
-DEFAULT_RISK_FEATURE_KEYS = (
-    'deepgini',
-    'stability_class_change_rate',
-    'mahalanobis_dist_pred_class',
-    'stability_entropy_variance',
-)
 
 
 def _as_label_vector(arr):
@@ -738,24 +754,35 @@ def build_or_load_risk_features(
     class_means=None,
     class_inv_covs=None,
     required_feature_keys=DEFAULT_RISK_FEATURE_KEYS,
+    write_cache=True,
 ):
+    """Load risk-feature cache if complete; otherwise compute via get_risk_features.
+
+    Parameters
+    ----------
+    write_cache:
+        If False, never write/overwrite the cache file (RQ scripts can load a shared
+        explore cache and score with DEFAULT_RISK_FEATURE_KEYS without saving rq1_*).
+    """
 
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / cache_name
+    required = list(required_feature_keys)
 
     if cache_path.is_file() and not force_recompute:
         z = np.load(cache_path)
         out = {k: np.asarray(z[k]) for k in z.files}
-        missing = [k for k in required_feature_keys if k not in out]
+        missing = [k for k in required if k not in out]
         if not missing:
             print(f'Loaded risk features from {cache_path}')
             return out
         print(
-            f'Risk feature cache missing keys {missing}; recomputing -> {cache_path}',
+            f'Risk feature cache missing keys {missing}; recomputing'
+            + (f' -> {cache_path}' if write_cache else ' (in-memory only)'),
         )
 
-    if 'mahalanobis_dist_pred_class' in required_feature_keys:
+    if 'mahalanobis_dist_pred_class' in required:
         if class_means is None or class_inv_covs is None:
             raise ValueError(
                 'class_means/class_inv_covs required for mahalanobis_dist_pred_class; '
@@ -775,8 +802,15 @@ def build_or_load_risk_features(
         class_means=class_means,
         class_inv_covs=class_inv_covs,
     )
-    np.savez_compressed(cache_path, **out)
-    print(f'Saved risk features to {cache_path}')
+    missing_after = [k for k in required if k not in out]
+    if missing_after:
+        raise KeyError(f'get_risk_features missing required keys: {missing_after}')
+
+    if write_cache:
+        np.savez_compressed(cache_path, **out)
+        print(f'Saved risk features to {cache_path}')
+    else:
+        print(f'Computed risk features in-memory (write_cache=False); not writing {cache_path}')
     return out
 
 
