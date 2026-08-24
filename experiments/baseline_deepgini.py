@@ -20,13 +20,13 @@ import tensorflow as tf
 tf.get_logger().setLevel('ERROR')
 logging.getLogger().setLevel(logging.WARNING)
 
-from training_models.load_data import load_cifar10, load_fmnist
+from training_models.load_data import load_cifar10, load_fmnist, load_svhn
 
 RQ1_BUDGET_RATIOS = [0.01, 0.03, 0.05, 0.10]
 RQ1_SEEDS = [0, 1, 2, 3, 4]
 RQ1_POOL_TYPES = ['adversarial', 'transformation']
 RQ1_ERROR_RATIOS = [0.10, 0.20]
-RQ1_DATASETS = ['fmnist', 'cifar10']
+RQ1_DATASETS = ['fmnist', 'cifar10', 'svhn']
 ERROR_SAMPLING_MODES = ('random', 'high_conf')
 
 DATASET_CONFIG = {
@@ -37,6 +37,10 @@ DATASET_CONFIG = {
     'cifar10': {
         'loader': load_cifar10,
         'model_path': _REPO_ROOT / 'models' / 'vgg19_cifar10' / 'tf_model.h5',
+    },
+    'svhn': {
+        'loader': load_svhn,
+        'model_path': _REPO_ROOT / 'models' / 'resnet18_svhn' / 'tf_model.h5',
     },
 }
 

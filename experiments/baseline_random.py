@@ -10,7 +10,7 @@ RQ1_BUDGET_RATIOS = [0.01, 0.03, 0.05, 0.10]
 RQ1_SEEDS = [0, 1, 2, 3, 4]
 RQ1_POOL_TYPES = ['adversarial', 'transformation']
 RQ1_ERROR_RATIOS = [0.10, 0.20]
-RQ1_DATASETS = ['fmnist', 'cifar10']
+RQ1_DATASETS = ['fmnist', 'cifar10', 'svhn']
 ERROR_SAMPLING_MODES = ('random', 'high_conf')
 
 
